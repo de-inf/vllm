@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
+    VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
@@ -1456,6 +1457,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "cutlass",
             "marlin",
         ],
+    ),
+    # Enable adaptive max_num_seqs for Mamba/hybrid models.
+    # When enabled, vLLM automatically calculates the optimal max_num_seqs
+    # based on the Mamba state size and GPU memory bandwidth to prevent
+    # memory bandwidth saturation at high batch sizes.
+    # This is especially useful for models like Nemotron-H with large
+    # Mamba state (float32 cache).
+    "VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS": lambda: bool(
+        int(os.getenv("VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS", "0"))
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.

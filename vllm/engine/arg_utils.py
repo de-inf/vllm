@@ -1963,6 +1963,182 @@ class EngineArgs:
             )
             self.enable_prefix_caching = False
 
+    @staticmethod
+    def _get_gpu_memory_bandwidth_tb_s() -> float | None:
+        """
+        Get estimated GPU memory bandwidth in TB/s based on device capability.
+
+        Returns conservative estimates for effective bandwidth (not peak).
+        Only supports Blackwell (SM 10.x) and Hopper (SM 9.x) GPUs.
+
+        Returns:
+            Effective bandwidth in TB/s, or None if GPU is not supported.
+        """
+        capability = current_platform.get_device_capability()
+        if capability is None:
+            return None
+
+        cap_int = capability.to_int()
+
+        # Memory bandwidth estimates (effective, not peak)
+        # Peak bandwidth * ~60-70% efficiency for scattered access
+        # Only tested on Blackwell and Hopper
+        if cap_int >= 100:
+            # Blackwell (B100/B200): ~8 TB/s peak, ~5 TB/s effective
+            return 5.0
+        elif cap_int >= 90:
+            # Hopper (H100/H200): ~3.35-4.8 TB/s peak, ~2.5 TB/s effective
+            return 2.5
+        else:
+            # Not supported - return None to indicate unsupported GPU
+            return None
+
+    def _calculate_adaptive_mamba_max_num_seqs(
+        self,
+        model_config: ModelConfig,
+    ) -> int | None:
+        """
+        Calculate optimal max_num_seqs for Mamba/hybrid models based on
+        Mamba state size and GPU memory bandwidth.
+
+        The Mamba SSM state is the primary memory bandwidth bottleneck during
+        decode. This function estimates the optimal batch size to avoid
+        saturating memory bandwidth.
+
+        Returns:
+            Optimal max_num_seqs, or None if model doesn't have Mamba layers.
+        """
+        if not model_config.has_inner_state:
+            return None
+
+        hf_config = model_config.hf_config
+
+        # Try to get Mamba state dimensions from config
+        # Different models use different attribute names
+        num_heads = (
+            getattr(hf_config, "mamba_num_heads", None)
+            or getattr(hf_config, "n_mamba_heads", None)
+            or getattr(hf_config, "mamba_n_heads", None)
+            or getattr(hf_config, "num_heads", None)
+        )
+
+        head_dim = (
+            getattr(hf_config, "mamba_head_dim", None)
+            or getattr(hf_config, "mamba_headdim", None)
+            or getattr(hf_config, "mamba_d_head", None)
+            or getattr(hf_config, "head_dim", None)
+        )
+
+        state_size = (
+            getattr(hf_config, "ssm_state_size", None)
+            or getattr(hf_config, "mamba_d_state", None)
+            or getattr(hf_config, "state_size", None)
+        )
+
+        # Check if it's a Mamba2 model (has heads) or Mamba1
+        if num_heads is None or head_dim is None or state_size is None:
+            # Try Mamba1 style config
+            intermediate_size = getattr(hf_config, "intermediate_size", None)
+            if intermediate_size is None:
+                expand = getattr(hf_config, "expand", 2) or getattr(
+                    hf_config, "mamba_expand", 2
+                )
+                hidden_size = getattr(hf_config, "hidden_size", None)
+                if hidden_size:
+                    intermediate_size = expand * hidden_size
+
+            if intermediate_size and state_size:
+                # Mamba1: state shape is [intermediate_size, state_size]
+                state_elements = intermediate_size * state_size
+            else:
+                logger.debug(
+                    "Could not determine Mamba state size for adaptive "
+                    "max_num_seqs calculation."
+                )
+                return None
+        else:
+            # Mamba2: state shape is [num_heads, head_dim, state_size]
+            state_elements = num_heads * head_dim * state_size
+
+        # Get cache dtype size
+        mamba_cache_dtype = self.mamba_ssm_cache_dtype or self.mamba_cache_dtype
+        if mamba_cache_dtype == "float32":
+            dtype_bytes = 4
+        elif mamba_cache_dtype in ("float16", "bfloat16"):
+            dtype_bytes = 2
+        else:
+            # Auto - assume float32 for safety
+            dtype_bytes = 4
+
+        # Count Mamba layers
+        num_layers = getattr(hf_config, "num_hidden_layers", 52)
+        hybrid_pattern = getattr(hf_config, "hybrid_override_pattern", None)
+        # Count 'M' for Mamba layers in hybrid pattern, or assume all layers
+        num_mamba_layers = hybrid_pattern.count("M") if hybrid_pattern else num_layers
+
+        if num_mamba_layers == 0:
+            return None
+
+        # Calculate state size per sequence (bytes)
+        # State is read and written each step, so 2x traffic
+        state_bytes_per_seq = state_elements * dtype_bytes * num_mamba_layers * 2
+
+        # Get GPU memory bandwidth and calculate target state traffic
+        # Based on empirical testing:
+        # - B200 (5 TB/s): optimal at ~35 GB state traffic per step (~384 seqs)
+        # - H100 (2.5 TB/s): optimal at ~17.5 GB state traffic per step (~192 seqs)
+        # This translates to ~7 GB per TB/s of effective bandwidth
+        gpu_bw_tb_s = self._get_gpu_memory_bandwidth_tb_s()
+
+        if gpu_bw_tb_s is None:
+            capability = current_platform.get_device_capability()
+            cap_str = (
+                f"SM {capability.major}.{capability.minor}" if capability else "unknown"
+            )
+            raise ValueError(
+                f"VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS is only supported on "
+                f"Blackwell (SM 10.x) and Hopper (SM 9.x) GPUs. "
+                f"Detected GPU capability: {cap_str}. "
+                f"Please set VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS=0 and manually "
+                f"tune --max-num-seqs for your hardware."
+            )
+
+        # Empirically tuned: ~7 GB state traffic per TB/s of effective bandwidth
+        # This keeps SSM kernel time reasonable while leaving headroom for
+        # MoE, attention, and scheduler overhead
+        target_state_traffic_bytes = int(gpu_bw_tb_s * 7e9)  # 7 GB per TB/s
+
+        # Calculate optimal max_num_seqs
+        optimal_seqs = int(target_state_traffic_bytes / state_bytes_per_seq)
+
+        # Apply TP scaling - state is sharded across TP ranks
+        tp_size = self.tensor_parallel_size
+        optimal_seqs = optimal_seqs * tp_size
+
+        # Clamp to reasonable range
+        optimal_seqs = max(64, min(optimal_seqs, 1024))
+
+        gpu_name = (
+            current_platform.get_device_name()
+            if hasattr(current_platform, "get_device_name")
+            else "unknown"
+        )
+
+        logger.info(
+            "Adaptive Mamba max_num_seqs: calculated optimal=%d "
+            "(GPU=%s, effective_bw=%.1f TB/s, state=%d elements, "
+            "%d Mamba layers, dtype=%s, TP=%d)",
+            optimal_seqs,
+            gpu_name,
+            gpu_bw_tb_s,
+            state_elements,
+            num_mamba_layers,
+            mamba_cache_dtype or "auto",
+            tp_size,
+        )
+
+        return optimal_seqs
+
     def _set_default_max_num_seqs_and_batched_tokens_args(
         self,
         usage_context: UsageContext | None,
@@ -1988,6 +2164,28 @@ class EngineArgs:
                 usage_context,
                 SchedulerConfig.DEFAULT_MAX_NUM_SEQS,
             )
+
+        # Apply adaptive max_num_seqs for Mamba models if enabled
+        # This acts as an upper bound even if user explicitly set a value
+        if envs.VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS:
+            adaptive_seqs = self._calculate_adaptive_mamba_max_num_seqs(model_config)
+            if adaptive_seqs is not None:
+                if self.max_num_seqs > adaptive_seqs:
+                    logger.warning(
+                        "Reducing max_num_seqs from %d to %d for optimal "
+                        "Mamba model performance (memory bandwidth limit). "
+                        "Set VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS=0 to disable.",
+                        self.max_num_seqs,
+                        adaptive_seqs,
+                    )
+                    self.max_num_seqs = adaptive_seqs
+                else:
+                    logger.info(
+                        "Adaptive Mamba max_num_seqs: current=%d is within "
+                        "optimal limit=%d",
+                        self.max_num_seqs,
+                        adaptive_seqs,
+                    )
 
         if orig_max_num_batched_tokens is None:
             if not self.enable_chunked_prefill:
