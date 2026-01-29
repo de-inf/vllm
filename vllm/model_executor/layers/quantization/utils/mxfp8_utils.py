@@ -131,7 +131,18 @@ direct_register_custom_op(
 class Mxfp8LinearOp:
     """
     This class executes a MXFP8 linear layer.
+
+    Supports two backends:
+    - "torch": Dequantizes weights to bf16 and uses torch.nn.functional.linear
+    - "flashinfer": Uses flashinfer's bmm_mxfp8 for native MXFP8 computation
     """
+
+    def __init__(self, backend: str = "torch"):
+        if backend not in ("torch", "flashinfer"):
+            raise ValueError(
+                f"Unsupported backend: {backend}. Must be 'torch' or 'flashinfer'."
+            )
+        self.backend = backend
 
     def apply(
         self,
@@ -141,22 +152,39 @@ class Mxfp8LinearOp:
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # weight_scale comes in as float8_e8m0fnu
-        # after process_weights_after_loading
-        # It may be padded to [N_padded, K/32] and flattened
-        # Convert back to uint8 for dequantization
-        weight_scale_uint8 = weight_scale.view(MXFP8_SCALE_DTYPE)
+        if self.backend == "flashinfer":
+            return self._apply_flashinfer(input, weight, weight_scale, out_dtype, bias)
+        return self._apply_torch(input, weight, weight_scale, out_dtype, bias)
 
+    def _apply_torch(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dequantize weights to bf16 and use torch.nn.functional.linear."""
         out_features, in_features = weight.shape
-        # Number of scale blocks along K dimension
         scale_k = in_features // MXFP8_BLOCK_SIZE
 
-        # Compute padded dimensions (same logic as process_weights_after_loading)
-        out_features_padded = (out_features + 127) // 128 * 128
-
-        # Reshape to padded 2D, then slice to get original shape
-        weight_scale_2d_padded = weight_scale_uint8.view(out_features_padded, scale_k)
-        weight_scale_2d = weight_scale_2d_padded[:out_features, :]
+        # Handle different weight_scale formats:
+        # 1. Raw 2D uint8 from quantization: shape (out_features, scale_k)
+        # 2. Processed 1D float8_e8m0fnu from process_weights_after_loading:
+        #    shape (out_features_padded * scale_k,)
+        if weight_scale.ndim == 2:
+            # Raw 2D scale - use directly
+            weight_scale_2d = weight_scale
+            if weight_scale_2d.dtype != MXFP8_SCALE_DTYPE:
+                weight_scale_2d = weight_scale_2d.view(MXFP8_SCALE_DTYPE)
+        else:
+            # Processed 1D scale - need to reshape
+            weight_scale_uint8 = weight_scale.view(MXFP8_SCALE_DTYPE)
+            out_features_padded = (out_features + 127) // 128 * 128
+            weight_scale_2d_padded = weight_scale_uint8.view(
+                out_features_padded, scale_k
+            )
+            weight_scale_2d = weight_scale_2d_padded[:out_features, :]
 
         # Dequantize weight to bf16
         weight_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale_2d)
@@ -164,3 +192,80 @@ class Mxfp8LinearOp:
         # Standard linear operation
         output = torch.nn.functional.linear(input, weight_bf16, bias)
         return output.to(out_dtype)
+
+    def _apply_flashinfer(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Use flashinfer's bmm_mxfp8 for native MXFP8 computation.
+
+        flashinfer's bmm_mxfp8 expects:
+        - A: (batch, M, K) - input, quantized as 3D tensor
+        - B: (batch, K, N) - weight, quantized as 3D tensor
+        - A_scale: 1D tensor from mxfp8_quantize (passed directly)
+        - B_scale: 1D tensor from mxfp8_quantize (passed directly)
+
+        IMPORTANT: Both A and B must be quantized as 3D tensors from the start.
+        The scales are 1D tensors that match the flattened structure expected by cuDNN.
+        """
+        out_features, in_features = weight.shape
+        input_shape = input.shape
+        input_2d = input.view(-1, in_features)
+        K = in_features
+        N = out_features
+
+        # Use swizzled=False to match the simpler non-swizzled scale layout
+        # Both swizzled and non-swizzled work with cuDNN, but must be consistent
+        is_swizzled = False
+
+        # Reshape input to 3D [1, M, K] BEFORE quantizing
+        # This ensures the scale structure matches what bmm_mxfp8 expects
+        input_3d = input_2d.unsqueeze(0)  # [1, M, K]
+        input_mxfp8, input_scale = torch.ops.vllm.mxfp8_quantize(input_3d, is_swizzled)
+
+        # For B matrix, we need the weight in [1, K, N] layout
+        # The checkpoint stores weight as [N, K] with scales for [N, K] layout
+        # We need to dequantize, transpose, and re-quantize in [1, K, N] layout
+
+        # Ensure weight_scale is in uint8 format
+        if weight_scale.dtype != MXFP8_SCALE_DTYPE:
+            weight_scale = weight_scale.view(MXFP8_SCALE_DTYPE)
+
+        # weight_scale should be 2D (N, K/32)
+        if weight_scale.ndim == 1:
+            scale_k = K // MXFP8_BLOCK_SIZE
+            out_features_padded = (N + 127) // 128 * 128
+            weight_scale = weight_scale.view(out_features_padded, scale_k)
+        # Slice to actual size if padded
+        weight_scale_2d = weight_scale[:N, : K // MXFP8_BLOCK_SIZE]
+
+        # Dequantize weight to bf16, transpose, then re-quantize for flashinfer
+        weight_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale_2d)
+        # Transpose to [K, N] and make contiguous, then add batch dim
+        weight_t_bf16 = weight_bf16.t().contiguous()
+        weight_3d = weight_t_bf16.unsqueeze(0)  # [1, K, N]
+
+        # Re-quantize in [1, K, N] layout with same swizzled setting as input
+        weight_t_mxfp8, weight_t_scale = torch.ops.vllm.mxfp8_quantize(
+            weight_3d, is_swizzled
+        )
+
+        # Pass tensors and scales directly to bmm_mxfp8
+        # A: [1, M, K], B: [1, K, N], scales are 1D tensors
+        output = torch.ops.vllm.bmm_mxfp8(
+            input_mxfp8, weight_t_mxfp8, input_scale, weight_t_scale, out_dtype, "cudnn"
+        )
+
+        # Remove batch dimension: (1, M, N) -> (M, N)
+        output = output.squeeze(0)
+
+        if bias is not None:
+            output = output + bias
+
+        # Reshape back to original input shape (except last dim is now out_features)
+        output_shape = (*input_shape[:-1], out_features)
+        return output.view(output_shape)
