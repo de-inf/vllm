@@ -254,6 +254,13 @@ class Mxfp8LinearOp:
             weight_3d, is_swizzled
         )
 
+        # bmm_mxfp8 expects 1D scales, but our mxfp8_quantize wrapper may
+        # reshape them to 2D. Flatten them back to 1D.
+        if input_scale.ndim > 1:
+            input_scale = input_scale.flatten()
+        if weight_t_scale.ndim > 1:
+            weight_t_scale = weight_t_scale.flatten()
+
         # Pass tensors and scales directly to bmm_mxfp8
         # A: [1, M, K], B: [1, K, N], scales are 1D tensors
         output = torch.ops.vllm.bmm_mxfp8(
