@@ -27,11 +27,12 @@ def mxfp8_e4m3_quantize(
         ) from err
 
     x_q, x_scales = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=is_sf_swizzled_layout)
-    if x_scales.ndim == 1:
+    # For 3D tensors (bmm), keep scales as 1D - bmm_mxfp8 expects 1D scales
+    # For 2D tensors, reshape to 2D for compatibility with existing code
+    if x_scales.ndim == 1 and x.ndim == 2:
         if is_sf_swizzled_layout:
-            # TODO: check this, maybe not required?
-            # When swizzled, scales are padded: M to multiple of 128, K to multiple of 4
-            # We must use the padded dimensions, not the original input dimensions
+            # When swizzled, scales are padded:
+            # M to multiple of 128, K/32 to multiple of 4
             def _round_up(val: int, mult: int) -> int:
                 return (val + mult - 1) // mult * mult
 
@@ -218,9 +219,9 @@ class Mxfp8LinearOp:
         K = in_features
         N = out_features
 
-        # Use swizzled=False to match the simpler non-swizzled scale layout
-        # Both swizzled and non-swizzled work with cuDNN, but must be consistent
-        is_swizzled = False
+        # cuDNN's bmm_mxfp8 uses reordering_type=F8_128x4 which expects
+        # swizzled scale layout. We MUST use is_swizzled=True to match.
+        is_swizzled = True
 
         # Reshape input to 3D [1, M, K] BEFORE quantizing
         # This ensures the scale structure matches what bmm_mxfp8 expects
