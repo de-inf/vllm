@@ -4,6 +4,8 @@
 Unit tests for Mxfp8LinearOp comparing torch and flashinfer backends.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -833,3 +835,105 @@ test_mxfp8_linear_stress_varying_m -v -s
         pytest.fail(f"Some M values failed: {failed_m_values}")
     else:
         print("\nAll M values passed!")
+
+
+@pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
+def test_mxfp8_checkpoint_layer_debug():
+    """Debug MXFP8 checkpoint layer scales against BF16 reference weights.
+
+    Requires:
+      - MODEL_PATH: MXFP8 checkpoint
+      - BF16_MODEL_PATH: BF16 checkpoint
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    model_path = os.environ.get("MODEL_PATH", "")
+    bf16_path = os.environ.get("BF16_MODEL_PATH", "")
+    if len(model_path) == 0 or len(bf16_path) == 0:
+        pytest.skip("MODEL_PATH/BF16_MODEL_PATH not set")
+
+    from pathlib import Path
+
+    from safetensors.torch import safe_open
+
+    mx_path = Path(model_path)
+    bf_path = Path(bf16_path)
+
+    # Use a representative layer with standard Llama dims.
+    weight_name = "model.layers.0.self_attn.q_proj.weight"
+    scale_name = "model.layers.0.self_attn.q_proj.weight_scale"
+
+    def _find_tensor(base: Path, name: str):
+        for f in base.iterdir():
+            if f.suffix == ".safetensors":
+                with safe_open(f, framework="pt", device="cpu") as h:
+                    if name in h:
+                        return h.get_tensor(name)
+        raise KeyError(name)
+
+    mx_weight = _find_tensor(mx_path, weight_name)
+    mx_scale = _find_tensor(mx_path, scale_name)
+    bf_weight = _find_tensor(bf_path, weight_name)
+
+    assert mx_weight.dtype == torch.float8_e4m3fn
+    assert mx_scale.dtype == torch.uint8
+    assert bf_weight.dtype == torch.bfloat16
+    assert mx_weight.shape == bf_weight.shape
+
+    n, k = mx_weight.shape
+    scale_k = k // MXFP8_BLOCK_SIZE
+    assert mx_scale.shape == (n, scale_k)
+
+    # Compare against expected ModelOpt scales for sanity.
+    import importlib
+    import sys
+
+    sys.path.append("/my_home/workspace/Model-Optimizer")
+    mx_module = importlib.import_module(
+        "modelopt.torch.quantization.qtensor.mxfp8_tensor"
+    )
+    expected = mx_module.MXFP8QTensor.get_weights_scaling_factor(bf_weight)
+    match_ratio = (expected == mx_scale).float().mean().item()
+    assert match_ratio > 0.999, f"Scale mismatch ratio: {match_ratio:.4f}"
+
+    # Run torch vs flashinfer on this real weight.
+    device = "cuda"
+    input_tensor = torch.randn(128, k, device=device, dtype=torch.bfloat16)
+    mx_weight = mx_weight.to(device)
+    mx_scale = mx_scale.to(device)
+    bf_weight = bf_weight.to(device)
+
+    reference = torch.nn.functional.linear(input_tensor, bf_weight)
+
+    torch_backend = Mxfp8LinearOp(backend="torch")
+    flashinfer_backend = Mxfp8LinearOp(backend="flashinfer")
+
+    output_torch = torch_backend.apply(
+        input=input_tensor,
+        weight=mx_weight,
+        weight_scale=mx_scale,
+        out_dtype=torch.bfloat16,
+        bias=None,
+    )
+    output_flashinfer = flashinfer_backend.apply(
+        input=input_tensor,
+        weight=mx_weight,
+        weight_scale=mx_scale,
+        out_dtype=torch.bfloat16,
+        bias=None,
+        out_features=n,
+        in_features=k,
+    )
+
+    ref_flat = reference.reshape(-1).float()
+    torch_flat = output_torch.reshape(-1).float()
+    fi_flat = output_flashinfer.reshape(-1).float()
+
+    torch_cos = torch.nn.functional.cosine_similarity(
+        ref_flat, torch_flat, dim=0
+    ).item()
+    fi_cos = torch.nn.functional.cosine_similarity(ref_flat, fi_flat, dim=0).item()
+
+    assert torch_cos > 0.9, f"Torch cosine similarity too low: {torch_cos:.4f}"
+    assert fi_cos > 0.8, f"Flashinfer cosine similarity too low: {fi_cos:.4f}"
