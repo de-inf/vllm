@@ -75,6 +75,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
     Mxfp8LinearOp,
+    dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -1849,11 +1850,24 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        # Initialize the MXFP8 linear operation with flashinfer backend
-        self.backend: str = "flashinfer"
+        # Initialize the MXFP8 linear operation.
+        # Default to flashinfer backend (W8A8) for best performance.
+        # NOTE: flashinfer backend is currently incompatible with ModelOpt checkpoints
+        # due to FP8 bit pattern differences between PyTorch's .to(float8_e4m3fn) and
+        # FlashInfer's GPU quantization kernel. This causes severe accuracy degradation.
+        # Default to torch backend (W8A16 - dequant weights to bf16) for accuracy.
+        # Users can override with VLLM_MXFP8_GEMM_BACKEND=flashinfer to test W8A8.
+        import os
+
+        self.backend: str = os.environ.get("VLLM_MXFP8_GEMM_BACKEND", "torch")
+        if self.backend not in ("flashinfer", "torch"):
+            raise ValueError(
+                f"Invalid VLLM_MXFP8_GEMM_BACKEND: {self.backend}. "
+                f"Must be 'flashinfer' (W8A8) or 'torch' (W8A16)."
+            )
         self.mxfp8_linear_op = Mxfp8LinearOp(backend=self.backend)
 
-        logger.info_once(f"Using {self.backend} backend for MXFP8 GEMM")
+        logger.info_once("Using %s backend for MXFP8 GEMM", self.backend)
 
     def create_weights(
         self,
@@ -2047,7 +2061,8 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             # Slice to correct dimensions
             weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
 
-        # Final validation of processed scale
+        # Final validation of processed scale (for torch backend)
+        # Note: FlashInfer backend will re-quantize and produce 1D swizzled scales
         assert weight_scale_2d.shape == (N, scale_k), (
             f"MXFP8 processed weight_scale shape {tuple(weight_scale_2d.shape)} "
             f"does not match expected shape ({N}, {scale_k})"
@@ -2058,19 +2073,73 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             weight_scale_2d = weight_scale_2d.view(torch.uint8)
 
         # ================================================================
+        # Re-quantization for FlashInfer CUTLASS compatibility
+        # ================================================================
+        # The mm_mxfp8 CUTLASS kernel requires SWIZZLED 1D scales (F8_128x4 layout).
+        # ModelOpt checkpoints export NON-SWIZZLED 2D scales, which are incompatible.
+        #
+        # For the flashinfer backend, we MUST re-quantize at load time:
+        # 1. Dequantize checkpoint weights to BF16 using checkpoint scales
+        # 2. Re-quantize using FlashInfer's mxfp8_quantize with swizzled=True
+        # 3. Use both the new FP8 values AND the new swizzled scales
+        #
+        # This is NOT about double quantization error - it's about scale FORMAT.
+        # The FP8 values themselves are similar, but the scale memory layout differs.
+
+        # Store original 2D non-swizzled scales for fallback (torch path)
+        weight_scale_2d_original = weight_scale_2d.clone()
+
+        if self.backend == "flashinfer":
+            # Dequantize checkpoint weights to BF16
+            weight_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale_2d)
+
+            # Re-quantize with FlashInfer's mxfp8_quantize (SWIZZLED format)
+            try:
+                from flashinfer import mxfp8_quantize
+
+                weight_requ, weight_scale_swizzled = mxfp8_quantize(
+                    weight_bf16,
+                    is_sf_swizzled_layout=True,  # CRITICAL: must be True!
+                )
+
+                processed_weight = weight_requ.contiguous()
+                # Swizzled scales are 1D for mm_mxfp8 CUTLASS kernel
+                weight_scale_for_storage = weight_scale_swizzled.contiguous()
+
+                logger.info_once(
+                    "MXFP8: Re-quantized weights with FlashInfer (swizzled scales) "
+                    "for CUTLASS kernel compatibility"
+                )
+            except Exception as e:
+                logger.warning(
+                    "MXFP8: Failed to re-quantize with FlashInfer (%s). "
+                    "Falling back to torch backend.",
+                    e,
+                )
+                self.backend = "torch"
+                processed_weight = weight.contiguous()
+                weight_scale_for_storage = weight_scale_2d_original
+        else:
+            # Torch backend - use checkpoint weights and 2D scales directly
+            processed_weight = weight.contiguous()
+            weight_scale_for_storage = weight_scale_2d_original
+
+        # ================================================================
         # Store processed tensors
         # ================================================================
 
         # Weight stays in [N, K] layout - FlashInfer handles transpose internally
-        # Ensure weight is contiguous for efficient memory access
-        processed_weight = weight.contiguous()
         assert processed_weight.is_contiguous(), (
             "MXFP8 weight must be contiguous for FlashInfer mm_mxfp8"
         )
 
         layer.weight = Parameter(processed_weight, requires_grad=False)
         layer.weight_scale = Parameter(
-            weight_scale_2d.contiguous(), requires_grad=False
+            weight_scale_for_storage.contiguous(), requires_grad=False
+        )
+        # Also store 2D non-swizzled scales for torch fallback (small M)
+        layer.weight_scale_2d = Parameter(
+            weight_scale_2d_original.contiguous(), requires_grad=False
         )
 
         # Store dimensions for runtime use
@@ -2140,6 +2209,9 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
 
         out_dtype = x.dtype
 
+        # Get 2D non-swizzled scales for fallback (if available)
+        weight_scale_2d = getattr(layer, "weight_scale_2d", None)
+
         return self.mxfp8_linear_op.apply(
             input=x,
             weight=layer.weight,
@@ -2148,6 +2220,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             bias=bias,
             out_features=layer.mxfp8_out_features,
             in_features=layer.mxfp8_in_features,
+            weight_scale_2d=weight_scale_2d,
         )
 
 

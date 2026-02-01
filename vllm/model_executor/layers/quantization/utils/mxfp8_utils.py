@@ -181,6 +181,7 @@ class Mxfp8LinearOp:
         # Flashinfer-specific metadata (set by process_weights_after_loading)
         out_features: int | None = None,
         in_features: int | None = None,
+        weight_scale_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.backend == "flashinfer":
             return self._apply_flashinfer(
@@ -191,6 +192,7 @@ class Mxfp8LinearOp:
                 bias,
                 out_features,
                 in_features,
+                weight_scale_2d,
             )
         return self._apply_torch(input, weight, weight_scale, out_dtype, bias)
 
@@ -243,6 +245,7 @@ class Mxfp8LinearOp:
         bias: torch.Tensor | None = None,
         out_features: int | None = None,
         in_features: int | None = None,
+        weight_scale_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Use flashinfer's mm_mxfp8 for native MXFP8 computation.
 
@@ -253,8 +256,8 @@ class Mxfp8LinearOp:
 
         Expects pre-processed weights from process_weights_after_loading:
         - weight: (N, K) - original layout from checkpoint
-        - weight_scale: 1D swizzled tensor or 2D tensor [N, K/32]
-          (for backward compatibility)
+        - weight_scale: 1D swizzled tensor for mm_mxfp8 CUTLASS kernel
+        - weight_scale_2d: 2D non-swizzled [N, K/32] for torch fallback
         """
         # Weight is in original [N, K] layout
         N, K = weight.shape
@@ -283,8 +286,12 @@ class Mxfp8LinearOp:
 
         # CUTLASS MXFP8 GEMM produces poor accuracy for very small M.
         # Fall back to the torch backend in that case.
+        # Use weight_scale_2d for fallback (2D non-swizzled for dequantization)
         if M_orig < min_dim:
-            return self._apply_torch(input, weight, weight_scale, out_dtype, bias)
+            fallback_scale = (
+                weight_scale_2d if weight_scale_2d is not None else weight_scale
+            )
+            return self._apply_torch(input, weight, fallback_scale, out_dtype, bias)
 
         # Pad M to a multiple of the minimum dimension (128) for CUTLASS.
         M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
@@ -292,18 +299,17 @@ class Mxfp8LinearOp:
             pad_rows = M_padded - M_orig
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
-        # Quantize input to MXFP8 with non-swizzled scales for CUTLASS.
-        input_mxfp8, input_scale = torch.ops.vllm.mxfp8_quantize(
-            input_2d,
-            False,  # Use non-swizzled scales for CUTLASS
-        )
-        if input_scale.ndim == 1:
-            input_scale_2d = input_scale.view(M_padded, K // MXFP8_BLOCK_SIZE)
-        else:
-            input_scale_2d = input_scale
+        # Quantize input to MXFP8 with SWIZZLED scales for CUTLASS.
+        # CRITICAL: mm_mxfp8 CUTLASS kernel requires BOTH input and weight
+        # scales to be in swizzled 1D format (F8_128x4 layout).
+        from flashinfer import mxfp8_quantize
 
-        # Call flashinfer_mm_mxfp8 helper (like flashinfer_scaled_fp4_mm)
-        # Helper handles transpose internally: weight [N, K] -> weight.t() [K, N]
+        input_mxfp8, input_scale = mxfp8_quantize(
+            input_2d,
+            is_sf_swizzled_layout=True,  # SWIZZLED - required for CUTLASS mm_mxfp8!
+        )
+        # Swizzled scales are 1D - pass as-is, don't reshape to 2D
+
         # Ensure the underlying tensor is contiguous to avoid illegal memory access
         # when the kernel traverses a non-contiguous base with a transposed view.
         if not weight.is_contiguous():
@@ -314,8 +320,8 @@ class Mxfp8LinearOp:
         output = flashinfer_mm_mxfp8(
             input_mxfp8,
             weight,  # [N, K] - helper will transpose internally
-            input_scale_2d,  # Non-swizzled 2D [M, K/32]
-            weight_scale,  # Swizzled 1D or 2D [N, K/32] - helper will transpose if 2D
+            input_scale,  # Swizzled 1D scale
+            weight_scale,  # Swizzled 1D scale (from process_weights_after_loading)
             out_dtype,
             backend="cutlass",
         )

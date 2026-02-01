@@ -607,12 +607,15 @@ def flashinfer_mm_mxfp8(
 
     Takes non-transposed weights and handles transpose internally.
 
+    CRITICAL: mm_mxfp8 CUTLASS kernel requires SWIZZLED 1D scales for optimal
+    performance and accuracy. Both input and weight scales should be in
+    swizzled format from FlashInfer's mxfp8_quantize(is_sf_swizzled_layout=True).
+
     Args:
         a: Input tensor [M, K] in MXFP8 format
         b: Weight tensor [N, K] in MXFP8 format (will be transposed internally)
-        block_scale_a: Input scale tensor [M, K/32] 2D or 1D swizzled
-        block_scale_b: Weight scale tensor [N, K/32] 2D or 1D swizzled
-            (will be transposed internally)
+        block_scale_a: Input scale tensor - 1D swizzled (preferred) or 2D [M, K/32]
+        block_scale_b: Weight scale tensor - 1D swizzled (preferred) or 2D [N, K/32]
         out_dtype: Output dtype (bfloat16 or float16)
         backend: Backend to use (default: "cutlass")
 
@@ -622,19 +625,21 @@ def flashinfer_mm_mxfp8(
     assert a.ndim == 2 and b.ndim == 2
     assert a.shape[1] == b.shape[1]  # K dimension must match
 
-    # Handle weight scale transpose: if 2D, transpose; if 1D swizzled, keep as-is
+    # For 1D swizzled scales, pass as-is to mm_mxfp8
+    # For 2D non-swizzled scales, transpose weight scale for mm_mxfp8 format
     if block_scale_b.ndim == 2:
         # 2D format - transpose to (K/32, N) for mm_mxfp8
-        block_scale_b_transposed = block_scale_b.t()
+        # Note: This path has lower accuracy than swizzled scales!
+        block_scale_b_final = block_scale_b.t()
     else:
-        # 1D swizzled format - mm_mxfp8 will handle it internally
-        block_scale_b_transposed = block_scale_b
+        # 1D swizzled format - optimal for CUTLASS kernel
+        block_scale_b_final = block_scale_b
 
     return mm_mxfp8(
         a,
         b.t(),  # Transpose weight: [N, K] -> [K, N]
         block_scale_a,
-        block_scale_b_transposed,
+        block_scale_b_final,
         out_dtype,
         backend=backend,
     )
