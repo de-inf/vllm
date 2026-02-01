@@ -539,9 +539,105 @@ if has_flashinfer():
         dtype: torch.dtype,
         backend: str = "cudnn",
     ) -> torch.Tensor:
+        # Handle both 2D and 3D inputs
+        if A.ndim == 2:
+            # 2D: A is [m, k], B is [k, n] -> output [m, n]
+            return torch.empty(A.shape[0], B.shape[1], dtype=dtype, device=A.device)
+        # 3D: A is [b, m, k], B is [b, k, n] -> output [b, m, n]
         return torch.empty(
             A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
         )
+
+    @torch.library.custom_op(
+        "vllm::mm_mxfp8",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def mm_mxfp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        backend: str = "cutlass",
+    ) -> torch.Tensor:
+        """MXFP8 MM - mirrors mm_fp4 API.
+
+        A: [M, K] row-major
+        B: [K, N] column-major (passed as weight.t())
+        A_scale: [M, K/32] 2D non-swizzled or 1D swizzled
+        B_scale: [K/32, N] 2D non-swizzled or 1D swizzled (passed as weight_scale.t())
+        """
+        from flashinfer import mm_mxfp8 as mm_mxfp8_
+
+        return mm_mxfp8_(
+            A=A,
+            B=B,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            out_dtype=dtype,
+            backend=backend,
+            out=None,
+        )
+
+    @torch.library.register_fake(
+        "vllm::mm_mxfp8",
+    )
+    def mm_mxfp8_fake(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        backend: str = "cutlass",
+    ) -> torch.Tensor:
+        # A is [m, k], B is [k, n] -> output [m, n]
+        return torch.empty(A.shape[0], B.shape[1], dtype=dtype, device=A.device)
+
+
+def flashinfer_mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    backend: str = "cutlass",
+) -> torch.Tensor:
+    """MXFP8 MM helper - mirrors flashinfer_scaled_fp4_mm API.
+
+    Takes non-transposed weights and handles transpose internally.
+
+    Args:
+        a: Input tensor [M, K] in MXFP8 format
+        b: Weight tensor [N, K] in MXFP8 format (will be transposed internally)
+        block_scale_a: Input scale tensor [M, K/32] 2D or 1D swizzled
+        block_scale_b: Weight scale tensor [N, K/32] 2D or 1D swizzled
+            (will be transposed internally)
+        out_dtype: Output dtype (bfloat16 or float16)
+        backend: Backend to use (default: "cutlass")
+
+    Returns:
+        Output tensor [M, N]
+    """
+    assert a.ndim == 2 and b.ndim == 2
+    assert a.shape[1] == b.shape[1]  # K dimension must match
+
+    # Handle weight scale transpose: if 2D, transpose; if 1D swizzled, keep as-is
+    if block_scale_b.ndim == 2:
+        # 2D format - transpose to (K/32, N) for mm_mxfp8
+        block_scale_b_transposed = block_scale_b.t()
+    else:
+        # 1D swizzled format - mm_mxfp8 will handle it internally
+        block_scale_b_transposed = block_scale_b
+
+    return mm_mxfp8(
+        a,
+        b.t(),  # Transpose weight: [N, K] -> [K, N]
+        block_scale_a,
+        block_scale_b_transposed,
+        out_dtype,
+        backend=backend,
+    )
 
 
 def flashinfer_scaled_fp4_mm(
