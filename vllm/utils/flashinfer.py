@@ -561,7 +561,7 @@ if has_flashinfer():
         dtype: torch.dtype,
         backend: str = "cutlass",
     ) -> torch.Tensor:
-        """MXFP8 MM - mirrors mm_fp4 API.
+        """MXFP8 MM - mirrors mm_mxfp8 API.
 
         A: [M, K] row-major
         B: [K, N] column-major (passed as weight.t())
@@ -571,13 +571,13 @@ if has_flashinfer():
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
         return mm_mxfp8_(
-            A=A,
-            B=B,
-            A_scale=A_scale,
-            B_scale=B_scale,
+            a=A,
+            b=B,
+            a_descale=A_scale,
+            b_descale=B_scale,
+            out=None,
             out_dtype=dtype,
             backend=backend,
-            out=None,
         )
 
     @torch.library.register_fake(
