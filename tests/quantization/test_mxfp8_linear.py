@@ -8,8 +8,10 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
     Mxfp8LinearOp,
     mxfp8_e4m3_quantize,
+    unswizzle_mxfp8_scale,
 )
 
 # Import flashinfer wrapper to register torch.ops.vllm.bmm_mxfp8
@@ -112,55 +114,91 @@ def create_mxfp8_weight(out_features: int, in_features: int, device: str = "cuda
     return weight_fp8, weight_scale, weight_bf16
 
 
+def _normalize_weight_scale_2d(
+    weight_scale: torch.Tensor, n: int, k: int
+) -> torch.Tensor:
+    scale_k = k // MXFP8_BLOCK_SIZE
+    if weight_scale.ndim == 1:
+        expected_plain = n * scale_k
+        expected_padded = ((n + 127) // 128) * 128 * ((scale_k + 3) // 4) * 4
+        if weight_scale.numel() == expected_plain:
+            weight_scale_2d = weight_scale.view(n, scale_k)
+        elif weight_scale.numel() == expected_padded:
+            weight_scale_2d = unswizzle_mxfp8_scale(weight_scale, n, k)
+        else:
+            raise ValueError(
+                "Unexpected MXFP8 weight_scale size. "
+                f"Got {weight_scale.numel()}, expected {expected_plain} "
+                f"(plain) or {expected_padded} (swizzled)."
+            )
+    else:
+        weight_scale_2d = weight_scale[:n, :scale_k]
+
+    if weight_scale_2d.dtype != torch.uint8:
+        weight_scale_2d = weight_scale_2d.view(torch.uint8)
+
+    return weight_scale_2d.contiguous()
+
+
 def preprocess_weight_for_flashinfer(
     weight_fp8: torch.Tensor,
     weight_scale: torch.Tensor,
 ):
     """Pre-process an existing MXFP8 weight for flashinfer backend.
 
-    This simulates what process_weights_after_loading does for flashinfer:
     - Keep weight in [N, K] layout (no transpose at load time)
     - Ensure scales are in 2D [N, K/32] non-swizzled format
-
-    Runtime uses mm_mxfp8 with .t() pattern (like mm_fp4):
-    - mm_mxfp8(input, weight.t(), input_scale, weight_scale.t(), dtype)
-    - No data copy, just transposed views!
-
-    Args:
-        weight_fp8: MXFP8 weight in [N, K] layout
-        weight_scale: Scale tensor in [N, K/32] layout (non-swizzled)
-
-    Returns:
-        (weight_fp8 [N, K], weight_scale [N, K/32])
     """
-    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        MXFP8_BLOCK_SIZE,
-    )
+    n, k = weight_fp8.shape
+    weight_scale_2d = _normalize_weight_scale_2d(weight_scale, n, k)
 
-    N, K = weight_fp8.shape
-    scale_k = K // MXFP8_BLOCK_SIZE
-
-    # Ensure weight_scale is 2D non-swizzled [N, K/32]
-    if weight_scale.ndim == 1:
-        # Assume it's non-swizzled 1D, reshape to 2D
-        weight_scale_2d = weight_scale.view(N, scale_k)
-    else:
-        weight_scale_2d = weight_scale[:N, :scale_k]
-
-    # Ensure uint8 dtype
-    if weight_scale_2d.dtype != torch.uint8:
-        weight_scale_2d = weight_scale_2d.view(torch.uint8)
-
-    # Return weight in original [N, K] layout with 2D scales
     return (
         weight_fp8,  # [N, K]
-        weight_scale_2d.contiguous(),  # [N, K/32]
+        weight_scale_2d,  # [N, K/32]
     )
 
 
 def create_input(batch_size: int, in_features: int, device: str = "cuda"):
     """Create a random bf16 input tensor."""
     return torch.randn(batch_size, in_features, device=device, dtype=torch.bfloat16)
+
+
+@pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
+def test_mxfp8_weight_scale_normalization():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    out_features, in_features = 128, 256
+
+    weight_bf16 = torch.randn(
+        out_features, in_features, device=device, dtype=torch.bfloat16
+    )
+
+    # Non-swizzled -> flattened
+    _, weight_scale_2d = mxfp8_e4m3_quantize(weight_bf16, is_sf_swizzled_layout=False)
+    weight_scale_flat = weight_scale_2d.contiguous().view(-1)
+    norm_flat = _normalize_weight_scale_2d(weight_scale_flat, out_features, in_features)
+    assert torch.equal(norm_flat, weight_scale_2d)
+
+    # Swizzled -> unswizzle to 2D
+    swizzled_out_features, swizzled_in_features = 128, 288
+    weight_bf16_swizzled = torch.randn(
+        swizzled_out_features,
+        swizzled_in_features,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    _, weight_scale_swizzled = mxfp8_e4m3_quantize(
+        weight_bf16_swizzled, is_sf_swizzled_layout=True
+    )
+    expected_unswizzled = unswizzle_mxfp8_scale(
+        weight_scale_swizzled, swizzled_out_features, swizzled_in_features
+    )
+    norm_swizzled = _normalize_weight_scale_2d(
+        weight_scale_swizzled, swizzled_out_features, swizzled_in_features
+    )
+    assert torch.equal(norm_swizzled, expected_unswizzled)
 
 
 @pytest.mark.parametrize(
@@ -270,6 +308,66 @@ def test_mxfp8_linear_backends_match(batch_size, in_features, out_features):
     assert fi_cos_sim > min_cos_sim, (
         f"Flashinfer cosine similarity too low: {fi_cos_sim:.4f} (need > {min_cos_sim})"
     )
+
+
+@pytest.mark.parametrize("batch_size", [1, 63, 127, 129, 255])
+@pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
+def test_mxfp8_linear_swizzled_scales(batch_size):
+    """Ensure swizzled scales are normalized correctly for flashinfer CUTLASS."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    in_features = 288
+    out_features = 128
+
+    weight_bf16 = torch.randn(
+        out_features, in_features, device=device, dtype=torch.bfloat16
+    )
+    weight_fp8, weight_scale_swizzled = mxfp8_e4m3_quantize(
+        weight_bf16, is_sf_swizzled_layout=True
+    )
+    assert weight_scale_swizzled.ndim == 1
+
+    weight_fp8_fi, weight_scale_fi = preprocess_weight_for_flashinfer(
+        weight_fp8, weight_scale_swizzled
+    )
+
+    input_tensor = create_input(batch_size, in_features, device)
+    reference = torch.nn.functional.linear(input_tensor, weight_bf16)
+
+    torch_backend = Mxfp8LinearOp(backend="torch")
+    flashinfer_backend = Mxfp8LinearOp(backend="flashinfer")
+
+    output_torch = torch_backend.apply(
+        input=input_tensor,
+        weight=weight_fp8,
+        weight_scale=weight_scale_fi,
+        out_dtype=torch.bfloat16,
+        bias=None,
+    )
+    output_flashinfer = flashinfer_backend.apply(
+        input=input_tensor,
+        weight=weight_fp8_fi,
+        weight_scale=weight_scale_fi,
+        out_dtype=torch.bfloat16,
+        bias=None,
+        out_features=out_features,
+        in_features=in_features,
+    )
+
+    ref_flat = reference.reshape(-1).float()
+    torch_flat = output_torch.reshape(-1).float()
+    fi_flat = output_flashinfer.reshape(-1).float()
+
+    torch_cos = torch.nn.functional.cosine_similarity(
+        ref_flat, torch_flat, dim=0
+    ).item()
+    fi_cos = torch.nn.functional.cosine_similarity(ref_flat, fi_flat, dim=0).item()
+
+    assert torch_cos > 0.9, f"Torch cosine similarity too low: {torch_cos:.4f}"
+    # Swizzled scales + padding can be noisier; allow a slightly looser bound.
+    assert fi_cos > 0.8, f"Flashinfer cosine similarity too low: {fi_cos:.4f}"
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 32, 128])
