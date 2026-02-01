@@ -281,28 +281,21 @@ class Mxfp8LinearOp:
             f"out_features is too small for mm_mxfp8."
         )
 
-        # Pad M to minimum dimension if needed
-        M_padded = M_orig
-        if M_orig < min_dim:
-            M_padded = min_dim
+        # Pad M to a multiple of the minimum dimension (128) for CUTLASS.
+        M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
+        if M_padded != M_orig:
             pad_rows = M_padded - M_orig
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
-        # Quantize input to MXFP8 with SWIZZLED layout for optimal performance
-        # Swizzled scales are passed directly to mm_mxfp8 which handles them
-        # automatically.
+        # Quantize input to MXFP8 with non-swizzled scales for CUTLASS.
         input_mxfp8, input_scale = torch.ops.vllm.mxfp8_quantize(
             input_2d,
-            True,  # Swizzled for optimal memory access
+            False,  # Use non-swizzled scales for CUTLASS
         )
-        # For swizzled scales, keep as 1D (flattened) - mm_mxfp8 will handle reshaping
-        # For non-swizzled scales (backward compatibility), reshape to 2D
         if input_scale.ndim == 1:
-            # Swizzled 1D format - keep as-is
-            input_scale_swizzled = input_scale
+            input_scale_2d = input_scale.view(M_padded, K // MXFP8_BLOCK_SIZE)
         else:
-            # Non-swizzled 2D format - reshape if needed
-            input_scale_swizzled = input_scale.view(M_padded, K // MXFP8_BLOCK_SIZE)
+            input_scale_2d = input_scale
 
         # Call flashinfer_mm_mxfp8 helper (like flashinfer_scaled_fp4_mm)
         # Helper handles transpose internally: weight [N, K] -> weight.t() [K, N]
@@ -316,14 +309,14 @@ class Mxfp8LinearOp:
         output = flashinfer_mm_mxfp8(
             input_mxfp8,
             weight,  # [N, K] - helper will transpose internally
-            input_scale_swizzled,  # Swizzled 1D or 2D [M, K/32]
+            input_scale_2d,  # Non-swizzled 2D [M, K/32]
             weight_scale,  # Swizzled 1D or 2D [N, K/32] - helper will transpose if 2D
             out_dtype,
             backend="cutlass",
         )
 
         # Slice output to remove padding if we padded M
-        if M_orig < min_dim:
+        if M_padded != M_orig:
             output = output[:M_orig, :]
 
         if bias is not None:

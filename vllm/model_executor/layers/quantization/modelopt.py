@@ -1877,6 +1877,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
             MXFP8_BLOCK_SIZE,
+            unswizzle_mxfp8_scale,
         )
 
         if layer.weight.dtype != MXFP8_VALUE_DTYPE:
@@ -1908,30 +1909,27 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             # consecutive values in the transposed layout corresponds to the
             # same block in the original layout, using the same scale value.
             #
-            # For optimal performance, we keep scales in swizzled format (1D)
-            # and pass them directly to mm_mxfp8, which handles the swizzled
-            # layout automatically.
+            # CUTLASS MXFP8 GEMM expects non-swizzled 2D scales.
 
             weight = layer.weight.data  # [N, K]
             weight_scale = layer.weight_scale.data  # [N, K/32] or 1D swizzled
             N, K = weight.shape
             scale_k = K // MXFP8_BLOCK_SIZE
 
-            # Keep swizzled scales as 1D; for 2D scales, ensure a contiguous [N, K/32].
             if weight_scale.ndim == 1:
-                weight_scale_swizzled = weight_scale
+                weight_scale_2d = unswizzle_mxfp8_scale(weight_scale, N, K)
             else:
-                weight_scale_swizzled = weight_scale[:N, :scale_k].contiguous()
+                weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
 
             # Ensure uint8 dtype
-            if weight_scale_swizzled.dtype != torch.uint8:
-                weight_scale_swizzled = weight_scale_swizzled.view(torch.uint8)
+            if weight_scale_2d.dtype != torch.uint8:
+                weight_scale_2d = weight_scale_2d.view(torch.uint8)
 
             # Store weight in original [N, K] layout
-            # Store scale in swizzled format (1D) or 2D format for runtime use
+            # Store scale in non-swizzled 2D format for runtime use
             layer.weight = torch.nn.Parameter(weight.data, requires_grad=False)
             layer.weight_scale = torch.nn.Parameter(
-                weight_scale_swizzled, requires_grad=False
+                weight_scale_2d, requires_grad=False
             )
 
             # Store dimensions for runtime use
