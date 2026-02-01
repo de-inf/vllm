@@ -281,6 +281,11 @@ class Mxfp8LinearOp:
             f"out_features is too small for mm_mxfp8."
         )
 
+        # CUTLASS MXFP8 GEMM produces poor accuracy for very small M.
+        # Fall back to the torch backend in that case.
+        if M_orig < min_dim:
+            return self._apply_torch(input, weight, weight_scale, out_dtype, bias)
+
         # Pad M to a multiple of the minimum dimension (128) for CUTLASS.
         M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
         if M_padded != M_orig:
