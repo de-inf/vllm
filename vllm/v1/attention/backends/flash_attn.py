@@ -4,12 +4,12 @@
 
 import copy
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
 
-from vllm.attention.layer import Attention
+from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -257,6 +257,26 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     )
     supports_update_block_table: bool = True
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_spec: "AttentionSpec",
+    ) -> AttentionCGSupport:
+        # FA2 does not support CUDA graphs with encoder-decoder models due to
+        # accuracy issues reported in https://github.com/vllm-project/vllm/issues/33091
+        if (
+            vllm_config.model_config.is_encoder_decoder
+            and get_flash_attn_version() == 2
+        ):
+            logger.warning_once(
+                "FlashAttention2 does not support CUDA graphs with "
+                "encoder-decoder models due to accuracy issues reported in #33091. "
+                "Disabling CUDA graph."
+            )
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -323,6 +343,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        **kwargs: Any,
     ) -> FlashAttentionMetadata:
         """
         fast_build disables AOT scheduling, used when there will be few
