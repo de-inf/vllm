@@ -75,7 +75,6 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
     Mxfp8LinearOp,
-    dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -1859,7 +1858,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         # Users can override with VLLM_MXFP8_GEMM_BACKEND=flashinfer to test W8A8.
         import os
 
-        self.backend: str = os.environ.get("VLLM_MXFP8_GEMM_BACKEND", "torch")
+        self.backend: str = os.environ.get("VLLM_MXFP8_GEMM_BACKEND", "flashinfer")
         if self.backend not in ("flashinfer", "torch"):
             raise ValueError(
                 f"Invalid VLLM_MXFP8_GEMM_BACKEND: {self.backend}. "
@@ -1942,27 +1941,40 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             f"group_size={self.quant_config.group_size}"
         )
 
+        # Weight scale: Can be either:
+        # - 1D swizzled (F8_128x4 layout) from ModelOpt with FlashInfer - preferred
+        # - 2D non-swizzled [N, K/32] from older ModelOpt exports
+        # We'll detect the format in process_weights_after_loading based on shape.
+
+        # Calculate expected swizzled scale size for 1D case:
+        # N_padded = ((N + 127) // 128) * 128, K_padded = ((K/32 + 3) // 4) * 4
+        n_padded = ((output_size_per_partition + 127) // 128) * 128
+        k_padded = ((num_scale_cols + 3) // 4) * 4
+        swizzled_scale_size = n_padded * k_padded
+
+        # Use 1D shape to accept swizzled scales from new ModelOpt exports
         weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                num_scale_cols,
-                dtype=MXFP8_SCALE_DTYPE,
-            ),
-            input_dim=1,
+            data=torch.empty(swizzled_scale_size, dtype=MXFP8_SCALE_DTYPE),
+            input_dim=0,  # 1D tensor for swizzled
             output_dim=0,
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
 
+        # Store expected dimensions for format detection
+        layer._mxfp8_expected_2d_shape = (output_size_per_partition, num_scale_cols)
+        layer._mxfp8_expected_swizzled_size = swizzled_scale_size
+
     def process_weights_after_loading(self, layer: Module) -> None:
         """Process loaded weights for FlashInfer MXFP8 GEMM.
 
-        FlashInfer mm_mxfp8 expects:
-        - Weight in [N, K] layout (original checkpoint layout)
-        - Weight scale in 2D non-swizzled format [N, K/32]
-        - Weight dtype: float8_e4m3fn
-        - Weight scale dtype: uint8 (E8M0 format)
+        MXFP8 checkpoint format (required):
+        - Weight: FP8 E4M3 values, shape [N, K]
+        - Weight scale: 1D swizzled uint8 (F8_128x4 layout for CUTLASS)
+
+        FlashInfer mm_mxfp8 requirements:
         - K >= 128, N >= 128, K divisible by 32
+        - Swizzled scales for optimal Blackwell performance
         """
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
             MXFP8_BLOCK_SIZE,
@@ -2022,107 +2034,48 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             f"quantized with MXFP8."
         )
 
-        # Check weight scale dimensions
-        assert weight_scale.ndim in (1, 2), (
-            f"MXFP8 weight_scale must be 1D (swizzled) or 2D [N, K/32], "
-            f"got {weight_scale.ndim}D with shape {tuple(weight_scale.shape)}"
+        # ================================================================
+        # Validate swizzled scale format (required for MXFP8)
+        # ================================================================
+        # MXFP8 requires 1D swizzled scales (F8_128x4 layout) for:
+        # - FlashInfer mm_mxfp8 CUTLASS kernel
+        # - Optimal performance on Blackwell GPUs
+
+        # Calculate expected swizzled size
+        n_padded = ((N + 127) // 128) * 128
+        k_padded = ((scale_k + 3) // 4) * 4
+        expected_swizzled_size = n_padded * k_padded
+
+        # Strict validation: must be 1D swizzled format
+        assert weight_scale.ndim == 1, (
+            f"MXFP8 weight_scale must be 1D swizzled (F8_128x4 layout), "
+            f"got {weight_scale.ndim}D with shape {tuple(weight_scale.shape)}. "
+            f"Re-export the model with ModelOpt using FlashInfer quantization."
         )
 
-        # Handle different weight_scale formats:
-        # 1. 2D tensor [N, K/32] - direct from checkpoint
-        # 2. 1D swizzled tensor - needs unswizzling
-        if weight_scale.ndim == 1:
-            # Validate 1D swizzled scale has expected size
-            # Swizzled format pads N to multiple of 128, K/32 to multiple of 4
-            n_padded = ((N + 127) // 128) * 128
-            k_padded = ((scale_k + 3) // 4) * 4
-            expected_swizzled_size = n_padded * k_padded
-
-            assert weight_scale.numel() == expected_swizzled_size, (
-                f"MXFP8 swizzled weight_scale has unexpected size. "
-                f"Got {weight_scale.numel()}, expected {expected_swizzled_size} "
-                f"(N_padded={n_padded}, K_padded={k_padded}). "
-                f"Weight shape is [N={N}, K={K}]."
-            )
-
-            # Unswizzle 1D swizzled scale to 2D format
-            weight_scale_2d = unswizzle_mxfp8_scale(weight_scale, N, K)
-        else:
-            # 2D format - validate shape
-            assert weight_scale.shape[0] >= N, (
-                f"MXFP8 weight_scale rows ({weight_scale.shape[0]}) must be >= "
-                f"weight rows (N={N})"
-            )
-            assert weight_scale.shape[1] >= scale_k, (
-                f"MXFP8 weight_scale cols ({weight_scale.shape[1]}) must be >= "
-                f"expected scale cols (K/32={scale_k})"
-            )
-
-            # Slice to correct dimensions
-            weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-
-        # Final validation of processed scale (for torch backend)
-        # Note: FlashInfer backend will re-quantize and produce 1D swizzled scales
-        assert weight_scale_2d.shape == (N, scale_k), (
-            f"MXFP8 processed weight_scale shape {tuple(weight_scale_2d.shape)} "
-            f"does not match expected shape ({N}, {scale_k})"
+        assert weight_scale.numel() == expected_swizzled_size, (
+            f"MXFP8 weight_scale has wrong size for swizzled format. "
+            f"Got {weight_scale.numel()}, expected {expected_swizzled_size} "
+            f"(N_padded={n_padded}, K_padded={k_padded}). "
+            f"Weight shape is [N={N}, K={K}]."
         )
 
-        # Ensure uint8 dtype for E8M0 scales
-        if weight_scale_2d.dtype != torch.uint8:
-            weight_scale_2d = weight_scale_2d.view(torch.uint8)
+        weight_scale_swizzled_1d = weight_scale.contiguous()
 
-        # ================================================================
-        # Re-quantization for FlashInfer CUTLASS compatibility
-        # ================================================================
-        # The mm_mxfp8 CUTLASS kernel requires SWIZZLED 1D scales (F8_128x4 layout).
-        # ModelOpt checkpoints export NON-SWIZZLED 2D scales, which are incompatible.
-        #
-        # For the flashinfer backend, we MUST re-quantize at load time:
-        # 1. Dequantize checkpoint weights to BF16 using checkpoint scales
-        # 2. Re-quantize using FlashInfer's mxfp8_quantize with swizzled=True
-        # 3. Use both the new FP8 values AND the new swizzled scales
-        #
-        # This is NOT about double quantization error - it's about scale FORMAT.
-        # The FP8 values themselves are similar, but the scale memory layout differs.
-
-        # Store original 2D non-swizzled scales for fallback (torch path)
-        weight_scale_2d_original = weight_scale_2d.clone()
+        # Unswizzle to 2D for torch backend fallback (small M < 128)
+        weight_scale_2d = unswizzle_mxfp8_scale(weight_scale_swizzled_1d, N, K)
 
         if self.backend == "flashinfer":
-            # Dequantize checkpoint weights to BF16
-            weight_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale_2d)
-
-            # Re-quantize with FlashInfer's mxfp8_quantize (SWIZZLED format)
-            try:
-                from flashinfer import mxfp8_quantize
-
-                weight_requ, weight_scale_swizzled = mxfp8_quantize(
-                    weight_bf16,
-                    is_sf_swizzled_layout=True,  # CRITICAL: must be True!
-                )
-
-                processed_weight = weight_requ.contiguous()
-                # Swizzled scales are 1D for mm_mxfp8 CUTLASS kernel
-                weight_scale_for_storage = weight_scale_swizzled.contiguous()
-
-                logger.info_once(
-                    "MXFP8: Re-quantized weights with FlashInfer (swizzled scales) "
-                    "for CUTLASS kernel compatibility"
-                )
-            except Exception as e:
-                logger.warning(
-                    "MXFP8: Failed to re-quantize with FlashInfer (%s). "
-                    "Falling back to torch backend.",
-                    e,
-                )
-                self.backend = "torch"
-                processed_weight = weight.contiguous()
-                weight_scale_for_storage = weight_scale_2d_original
-        else:
-            # Torch backend - use checkpoint weights and 2D scales directly
+            # Use swizzled scales directly - optimal path
             processed_weight = weight.contiguous()
-            weight_scale_for_storage = weight_scale_2d_original
+            weight_scale_for_storage = weight_scale_swizzled_1d
+        else:
+            # Torch backend - use unswizzled 2D scales for dequantization
+            processed_weight = weight.contiguous()
+            weight_scale_for_storage = weight_scale_2d
+
+        # Store 2D non-swizzled scales for torch fallback (small M)
+        weight_scale_2d_original = weight_scale_2d
 
         # ================================================================
         # Store processed tensors
