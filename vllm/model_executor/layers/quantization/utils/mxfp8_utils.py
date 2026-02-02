@@ -14,6 +14,55 @@ MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
 
 
+def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
+    """
+    Swizzle MXFP8 scale factors from row-major 2D layout to F8_128x4 layout.
+
+    The F8_128x4 swizzle pattern uses 128x4 tiles where scales are arranged as:
+    [m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]
+
+    This is the inverse of unswizzle_mxfp8_scale.
+
+    Args:
+        sf: 2D scale tensor (uint8) of shape [M, K/32]
+        M: Number of rows in the original tensor
+        K: Number of columns in the original tensor (not K/32)
+
+    Returns:
+        1D swizzled scale tensor for FlashInfer mm_mxfp8 CUTLASS kernel
+    """
+    scaling_vector_size = MXFP8_BLOCK_SIZE  # 32 for MXFP8
+    factor = scaling_vector_size * 4  # 128
+
+    # Calculate tile counts with padding
+    num_m_tiles = (M + 127) // 128
+    num_k_tiles = (K + factor - 1) // factor
+
+    # Padded dimensions
+    m_padded = num_m_tiles * 128
+    k_scale_padded = num_k_tiles * 4
+
+    # Pad scale tensor to tile-aligned dimensions
+    scale_cols = K // scaling_vector_size
+    sf_padded = torch.zeros(
+        (m_padded, k_scale_padded), dtype=sf.dtype, device=sf.device
+    )
+    sf_padded[:M, :scale_cols] = sf
+
+    # Reshape to tile structure for swizzling
+    # From: [m_padded, k_scale_padded] = [num_m_tiles * 128, num_k_tiles * 4]
+    # The 2D unswizzled layout after reshape is [num_m_tiles, 4, 32, num_k_tiles, 4]
+    # where 4*32 = 128 (inner_m, outer_m) and num_k_tiles*4 = k_scale_padded
+    sf_reshaped = sf_padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+
+    # Transpose dims 1 and 3 to get swizzled layout
+    # [num_m_tiles, 4, 32, num_k_tiles, 4] -> [num_m_tiles, num_k_tiles, 32, 4, 4]
+    sf_swizzled = sf_reshaped.transpose(1, 3)
+
+    # Flatten to 1D
+    return sf_swizzled.contiguous().view(-1)
+
+
 def unswizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
     """
     Unswizzle MXFP8 scale factors from F8_128x4 layout to row-major 2D layout.
@@ -89,18 +138,37 @@ def _cast_mxfp8_scales_to_bf16(scales: torch.Tensor) -> torch.Tensor:
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """
     Dequantize MXFP8 tensor to BF16.
+
+    Uses the same approach as ModelOpt's MXFP8QTensor.dequantize():
+    - Convert E8M0 biased exponent to scale: descale = 2^(exponent - 127)
+    - Reshape data to blocked form for broadcasting
+    - Multiply and reshape back
+
     Args:
-        x: FP8 E4M3 tensor to dequantize
-        scales: uint8 tensor containing MXFP8 scales
+        x: FP8 E4M3 tensor to dequantize, shape [..., K]
+        scales: uint8 E8M0 scale tensor, shape [..., K/32]
+
     Returns:
-        BF16 dequantized tensor
+        BF16 dequantized tensor, shape [..., K]
     """
-    scales_bf16 = _cast_mxfp8_scales_to_bf16(scales)
-    # Repeat scales along the last dimension to match the block size
-    scales_expanded = scales_bf16.reshape(*x.shape[:-1], -1).repeat_interleave(
-        MXFP8_BLOCK_SIZE, dim=-1
-    )
-    return x.to(torch.bfloat16) * scales_expanded
+    # Convert FP8 to float32 for precision (matches ModelOpt)
+    x_float = x.to(torch.float32)
+
+    # Reshape to blocked form: [..., K] -> [..., K/32, 32]
+    num_blocks = x.shape[-1] // MXFP8_BLOCK_SIZE
+    x_blocked = x_float.view(*x.shape[:-1], num_blocks, MXFP8_BLOCK_SIZE)
+
+    # Convert E8M0 biased exponent to scale factor: descale = 2^(exponent - 127)
+    # This matches ModelOpt: torch.exp2(e8m0_scale.float() - 127)
+    descale = torch.exp2(scales.to(torch.float32) - 127.0)
+
+    # Broadcast multiply: [..., K/32] -> [..., K/32, 1] for broadcasting
+    dequantized = x_blocked * descale.unsqueeze(-1)
+
+    # Reshape back: [..., K/32, 32] -> [..., K]
+    dequantized = dequantized.view(*x.shape)
+
+    return dequantized.to(torch.bfloat16)
 
 
 def mxfp8_e4m3_quantize_fake(
@@ -284,9 +352,8 @@ class Mxfp8LinearOp:
             f"out_features is too small for mm_mxfp8."
         )
 
-        # CUTLASS MXFP8 GEMM produces poor accuracy for very small M.
-        # Fall back to the torch backend in that case.
-        # Use weight_scale_2d for fallback (2D non-swizzled for dequantization)
+        # CUTLASS MXFP8 GEMM requires minimum M dimension for efficiency.
+        # Fall back to torch (dequant to BF16) for small M.
         if M_orig < min_dim:
             fallback_scale = (
                 weight_scale_2d if weight_scale_2d is not None else weight_scale
@@ -299,30 +366,42 @@ class Mxfp8LinearOp:
             pad_rows = M_padded - M_orig
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
-        # Quantize input to MXFP8 with SWIZZLED scales for CUTLASS.
-        # CRITICAL: mm_mxfp8 CUTLASS kernel requires BOTH input and weight
-        # scales to be in swizzled 1D format (F8_128x4 layout).
-        from flashinfer import mxfp8_quantize
+        # Quantize input to MXFP8 with SWIZZLED scales.
+        # FlashInfer mm_mxfp8 accuracy is MUCH better with swizzled scales:
+        # - Swizzled: cos_sim ~0.999 (excellent)
+        # - Non-swizzled: cos_sim ~0.83 (poor)
+        # Weight scales are pre-swizzled in process_weights_after_loading.
+        from flashinfer import mm_mxfp8, mxfp8_quantize
 
+        # Quantize input with swizzled scale format
         input_mxfp8, input_scale = mxfp8_quantize(
             input_2d,
-            is_sf_swizzled_layout=True,  # SWIZZLED - required for CUTLASS mm_mxfp8!
+            is_sf_swizzled_layout=True,  # Swizzled for best accuracy
         )
-        # Swizzled scales are 1D - pass as-is, don't reshape to 2D
 
-        # Ensure the underlying tensor is contiguous to avoid illegal memory access
-        # when the kernel traverses a non-contiguous base with a transposed view.
+        # Ensure the underlying tensor is contiguous
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        from vllm.utils.flashinfer import flashinfer_mm_mxfp8
+        # Debug: Log tensor shapes before mm_mxfp8
+        if not hasattr(self, "_logged_shapes"):
+            self._logged_shapes = True
+            logger.info(
+                "mm_mxfp8 call: input=%s, weight=%s, input_scale=%s, weight_scale=%s",
+                tuple(input_mxfp8.shape),
+                tuple(weight.shape),
+                tuple(input_scale.shape),
+                tuple(weight_scale.shape),
+            )
 
-        output = flashinfer_mm_mxfp8(
-            input_mxfp8,
-            weight,  # [N, K] - helper will transpose internally
-            input_scale,  # Swizzled 1D scale
-            weight_scale,  # Swizzled 1D scale (from process_weights_after_loading)
-            out_dtype,
+        # Both input_scale and weight_scale are 1D swizzled format
+        # weight is [N, K], mm_mxfp8 expects b as [K, N]
+        output = mm_mxfp8(
+            input_mxfp8,  # [M, K] row-major
+            weight.t(),  # [N, K] -> [K, N]
+            input_scale,  # 1D swizzled
+            weight_scale,  # 1D swizzled (from process_weights_after_loading)
+            out_dtype=out_dtype,
             backend="cutlass",
         )
 
