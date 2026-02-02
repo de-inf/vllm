@@ -354,11 +354,11 @@ class Mxfp8LinearOp:
 
         # CUTLASS MXFP8 GEMM requires minimum M dimension for efficiency.
         # Fall back to torch (dequant to BF16) for small M.
-        if M_orig < min_dim:
-            fallback_scale = (
-                weight_scale_2d if weight_scale_2d is not None else weight_scale
-            )
-            return self._apply_torch(input, weight, fallback_scale, out_dtype, bias)
+        # if M_orig < min_dim:
+        #    fallback_scale = (
+        #        weight_scale_2d if weight_scale_2d is not None else weight_scale
+        #    )
+        #    return self._apply_torch(input, weight, fallback_scale, out_dtype, bias)
 
         # Pad M to a multiple of the minimum dimension (128) for CUTLASS.
         M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
