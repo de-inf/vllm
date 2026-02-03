@@ -140,8 +140,6 @@ direct_register_custom_op(
 
 
 class Mxfp8LinearOp:
-    """Execute an MXFP8 linear layer."""
-
     def __init__(self, backend: Mxfp8Backend):
         if backend not in Mxfp8Backend:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -181,7 +179,6 @@ class Mxfp8LinearOp:
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Dequantize weights to bf16 and use torch.nn.functional.linear."""
         out_features, in_features = weight.shape
         scale_k = in_features // MXFP8_BLOCK_SIZE
 
@@ -213,7 +210,6 @@ class Mxfp8LinearOp:
         in_features: int | None = None,
         weight_scale_2d: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Use flashinfer's mm_mxfp8 for native MXFP8 computation."""
         N, K = weight.shape
         if out_features is not None:
             N = out_features
@@ -249,16 +245,6 @@ class Mxfp8LinearOp:
 
         if not weight.is_contiguous():
             weight = weight.contiguous()
-
-        if not hasattr(self, "_logged_shapes"):
-            self._logged_shapes = True
-            logger.info(
-                "mm_mxfp8 call: input=%s, weight=%s, input_scale=%s, weight_scale=%s",
-                tuple(input_mxfp8.shape),
-                tuple(weight.shape),
-                tuple(input_scale.shape),
-                tuple(weight_scale.shape),
-            )
 
         output = mm_mxfp8(
             input_mxfp8,
