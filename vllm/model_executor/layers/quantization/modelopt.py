@@ -74,6 +74,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+    Mxfp8Backend,
     Mxfp8LinearOp,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1832,9 +1833,9 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        self.backend: str = "flashinfer"
-        self.mxfp8_linear_op = Mxfp8LinearOp(backend=self.backend)
-        logger.info_once("Using %s backend for MXFP8 GEMM", self.backend)
+        backend: Mxfp8Backend = Mxfp8Backend.FLASHINFER_CUTLASS
+        self.mxfp8_linear_op = Mxfp8LinearOp(backend=backend)
+        logger.info_once("Using %s backend for MXFP8 GEMM", backend.value)
 
     def create_weights(
         self,
