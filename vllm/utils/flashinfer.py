@@ -504,51 +504,6 @@ if has_flashinfer():
         )
 
     @torch.library.custom_op(
-        "vllm::bmm_mxfp8",
-        mutates_args=[],
-        device_types="cuda",
-    )
-    def bmm_mxfp8(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        backend: str = "cudnn",
-    ) -> torch.Tensor:
-        from flashinfer import bmm_mxfp8 as bmm_mxfp8_
-
-        return bmm_mxfp8_(
-            A=A,
-            B=B,
-            A_scale=A_scale,
-            B_scale=B_scale,
-            dtype=dtype,
-            backend=backend,
-            out=None,
-        )
-
-    @torch.library.register_fake(
-        "vllm::bmm_mxfp8",
-    )
-    def bmm_mxfp8_fake(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        backend: str = "cudnn",
-    ) -> torch.Tensor:
-        # Handle both 2D and 3D inputs
-        if A.ndim == 2:
-            # 2D: A is [m, k], B is [k, n] -> output [m, n]
-            return torch.empty(A.shape[0], B.shape[1], dtype=dtype, device=A.device)
-        # 3D: A is [b, m, k], B is [b, k, n] -> output [b, m, n]
-        return torch.empty(
-            A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
-        )
-
-    @torch.library.custom_op(
         "vllm::mm_mxfp8",
         mutates_args=[],
         device_types="cuda",
@@ -558,16 +513,9 @@ if has_flashinfer():
         B: torch.Tensor,
         A_scale: torch.Tensor,
         B_scale: torch.Tensor,
-        dtype: torch.dtype,
+        out_dtype: torch.dtype,
         backend: str = "cutlass",
     ) -> torch.Tensor:
-        """MXFP8 MM - mirrors mm_mxfp8 API.
-
-        A: [M, K] row-major
-        B: [K, N] column-major (passed as weight.t())
-        A_scale: [M, K/32] 2D non-swizzled or 1D swizzled
-        B_scale: [K/32, N] 2D non-swizzled or 1D swizzled (passed as weight_scale.t())
-        """
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
         return mm_mxfp8_(
@@ -576,7 +524,7 @@ if has_flashinfer():
             a_descale=A_scale,
             b_descale=B_scale,
             out=None,
-            out_dtype=dtype,
+            out_dtype=out_dtype,
             backend=backend,
         )
 
@@ -588,11 +536,11 @@ if has_flashinfer():
         B: torch.Tensor,
         A_scale: torch.Tensor,
         B_scale: torch.Tensor,
-        dtype: torch.dtype,
+        out_dtype: torch.dtype,
         backend: str = "cutlass",
     ) -> torch.Tensor:
         # A is [m, k], B is [k, n] -> output [m, n]
-        return torch.empty(A.shape[0], B.shape[1], dtype=dtype, device=A.device)
+        return torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
 
 
 def flashinfer_mm_mxfp8(

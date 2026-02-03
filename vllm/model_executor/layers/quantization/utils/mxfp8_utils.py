@@ -4,9 +4,9 @@
 from enum import Enum
 
 import torch
-from flashinfer import mm_mxfp8, mxfp8_quantize
 
 from vllm.logger import init_logger
+from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -69,13 +69,23 @@ def unswizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
     return sf_unswizzle_sliced.contiguous()
 
 
-def mxfp8_e4m3_quantize(
+def _mxfp8_e4m3_quantize_impl(
     x: torch.Tensor, is_sf_swizzled_layout: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    x_q, x_scales = mxfp8_quantize(x, is_sf_swizzled_layout=is_sf_swizzled_layout)
+    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+
+    x_q, x_scales = flashinfer_mxfp8_quantize(
+        x, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
     if x_scales.ndim == 1 and x.ndim == 2 and not is_sf_swizzled_layout:
         x_scales = x_scales.view(x.size(0), -1)
     return x_q, x_scales
+
+
+def mxfp8_e4m3_quantize(
+    x: torch.Tensor, is_sf_swizzled_layout: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.vllm.mxfp8_quantize(x, is_sf_swizzled_layout)
 
 
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -134,7 +144,7 @@ def mxfp8_e4m3_quantize_fake(
 
 direct_register_custom_op(
     op_name="mxfp8_quantize",
-    op_func=mxfp8_e4m3_quantize,
+    op_func=_mxfp8_e4m3_quantize_impl,
     fake_impl=mxfp8_e4m3_quantize_fake,
 )
 
@@ -238,7 +248,7 @@ class Mxfp8LinearOp:
             pad_rows = M_padded - M_orig
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
-        input_mxfp8, input_scale = mxfp8_quantize(
+        input_mxfp8, input_scale = mxfp8_e4m3_quantize(
             input_2d,
             is_sf_swizzled_layout=True,  # Swizzled for best accuracy
         )
@@ -246,7 +256,7 @@ class Mxfp8LinearOp:
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        output = mm_mxfp8(
+        output = vllm_flashinfer.mm_mxfp8(
             input_mxfp8,
             weight.t(),
             input_scale,
