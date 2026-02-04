@@ -76,32 +76,33 @@ def unswizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
     return sf_unswizzle_sliced.contiguous()
 
 
-# Optimized autotune configs for B200/modern GPUs (trimmed for faster autotuning)
+# Optimized autotune configs for B200 Blackwell GPUs (trimmed for faster autotuning)
+# B200 optimizations: num_stages=5 for better pipelining, num_warps=8 for larger blocks
 # BLOCK_K is fixed at 32 for MXFP8 (required by per-32-element scaling)
 _MXFP8_TRITON_CONFIGS = [
-    # Large matrices (batch size >= 128)
+    # Large matrices (M >= 128) - high throughput configs
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
         num_warps=8,
-        num_stages=4,
+        num_stages=5,  # B200 benefits from more stages
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=4,
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 16},
+        num_warps=8,
+        num_stages=5,
     ),
-    # Medium matrices (batch size 32-128)
+    # Medium matrices (32 <= M < 128)
     triton.Config(
         {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
         num_warps=4,
-        num_stages=4,
+        num_stages=5,
     ),
     triton.Config(
         {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
         num_warps=4,
         num_stages=4,
     ),
-    # Small batch sizes (batch size < 32)
+    # Small batch sizes (M < 32)
     triton.Config(
         {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
         num_warps=4,
@@ -215,24 +216,29 @@ def _mxfp8_block_scaled_mm_kernel(
 
     # Main loop: iterate over K dimension in BLOCK_K (32) steps
     # Each iteration has exactly one scale per row/column
+    # Optimized for B200: better pipelining with num_stages=5
     for k_idx in range(0, num_k_iters):
         # Load A and B blocks (BLOCK_K = 32 elements in K dimension)
+        # Using block_ptr for efficient tensor core utilization on B200
         a = tl.load(p_a, boundary_check=(0, 1), padding_option="zero")
         b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
 
         # Load scales and convert from E8M0 (biased exponent) to float multiplier
+        # Scales are uint8, convert to float32 then apply exp2
         a_s_raw = tl.load(As_base + k_idx * stride_As_k, mask=mask_m, other=0)
         b_s_raw = tl.load(Bs_base + k_idx * stride_Bs_k, mask=mask_n, other=0)
 
         # E8M0 to float: scale = 2^(value - 127)
+        # The compiler optimizes the constant -127.0
         a_s = tl.exp2(a_s_raw.to(tl.float32) - 127.0)
         b_s = tl.exp2(b_s_raw.to(tl.float32) - 127.0)
 
         # Compute scaled dot product and accumulate
-        # tl.dot uses tensor cores for FP8 when available
+        # tl.dot uses tensor cores for FP8 when available on B200
+        # Apply scales element-wise: (A @ B) * (a_scale[:, None] * b_scale[None, :])
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
 
-        # Advance pointers
+        # Advance pointers for next iteration
         p_a = tl.advance(p_a, (0, BLOCK_K))
         p_b = tl.advance(p_b, (BLOCK_K, 0))
 
