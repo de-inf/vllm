@@ -76,6 +76,13 @@ def unswizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
     return sf_unswizzle_sliced.contiguous()
 
 
+def _mxfp8_swizzled_scale_numel(m: int, scale_k: int) -> int:
+    """Return the expected number of elements for swizzled scale layout."""
+    m_padded = ((m + 127) // 128) * 128
+    k_padded = ((scale_k + 3) // 4) * 4
+    return m_padded * k_padded
+
+
 # Optimized autotune configs for B200 Blackwell GPUs (trimmed for faster autotuning)
 # B200 optimizations: num_stages=5 for better pipelining, num_warps=8 for larger blocks
 # BLOCK_K is fixed at 32 for MXFP8 (required by per-32-element scaling)
@@ -140,6 +147,9 @@ def _mxfp8_block_scaled_mm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # Must be 32 for MXFP8 (matches scale granularity)
     GROUP_SIZE_M: tl.constexpr,
+    AS_SWIZZLED: tl.constexpr,
+    BS_SWIZZLED: tl.constexpr,
+    USE_DOT_SCALED: tl.constexpr,
 ):
     """
     Optimized MXFP8 block-scaled matrix multiplication kernel.
@@ -193,6 +203,8 @@ def _mxfp8_block_scaled_mm_kernel(
 
     # Number of K iterations (each processes BLOCK_K=32 elements)
     num_k_iters = tl.cdiv(K, BLOCK_K)
+    # Number of k-tiles in swizzled layout (each tile covers 4 scale entries)
+    num_k_tiles = tl.cdiv(num_k_iters, 4)
 
     # Use block_ptr for A and B for efficient loading with tensor cores
     p_a = tl.make_block_ptr(
@@ -225,18 +237,56 @@ def _mxfp8_block_scaled_mm_kernel(
 
         # Load scales and convert from E8M0 (biased exponent) to float multiplier
         # Scales are uint8, convert to float32 then apply exp2
-        a_s_raw = tl.load(As_base + k_idx * stride_As_k, mask=mask_m, other=0)
-        b_s_raw = tl.load(Bs_base + k_idx * stride_Bs_k, mask=mask_n, other=0)
+        if AS_SWIZZLED:
+            m_idx = offs_m_safe
+            m_tile = m_idx // 128
+            m_inner = m_idx % 128
+            m_block = m_inner // 32
+            m_lane = m_inner % 32
+            k_tile = k_idx // 4
+            k_lane = k_idx % 4
+            a_swizzled_idx = (
+                ((m_tile * num_k_tiles + k_tile) * 32 + m_lane) * 4 + m_block
+            ) * 4 + k_lane
+            a_s_raw = tl.load(As + a_swizzled_idx, mask=mask_m, other=0)
+        else:
+            a_s_raw = tl.load(As_base + k_idx * stride_As_k, mask=mask_m, other=0)
+
+        if BS_SWIZZLED:
+            n_idx = offs_n_safe
+            n_tile = n_idx // 128
+            n_inner = n_idx % 128
+            n_block = n_inner // 32
+            n_lane = n_inner % 32
+            k_tile = k_idx // 4
+            k_lane = k_idx % 4
+            b_swizzled_idx = (
+                ((n_tile * num_k_tiles + k_tile) * 32 + n_lane) * 4 + n_block
+            ) * 4 + k_lane
+            b_s_raw = tl.load(Bs + b_swizzled_idx, mask=mask_n, other=0)
+        else:
+            b_s_raw = tl.load(Bs_base + k_idx * stride_Bs_k, mask=mask_n, other=0)
 
         # E8M0 to float: scale = 2^(value - 127)
         # The compiler optimizes the constant -127.0
         a_s = tl.exp2(a_s_raw.to(tl.float32) - 127.0)
         b_s = tl.exp2(b_s_raw.to(tl.float32) - 127.0)
 
-        # Compute scaled dot product and accumulate
-        # tl.dot uses tensor cores for FP8 when available on B200
-        # Apply scales element-wise: (A @ B) * (a_scale[:, None] * b_scale[None, :])
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        # Compute scaled dot product and accumulate.
+        # Some Triton builds error on pointer-based tl.dot_scaled, so keep a
+        # compile-time fallback to tl.dot for compatibility.
+        if USE_DOT_SCALED:
+            accumulator = tl.dot_scaled(
+                a,
+                a_s[:, None],
+                "e4m3",
+                b,
+                b_s[:, None],
+                "e4m3",
+                accumulator,
+            )
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
 
         # Advance pointers for next iteration
         p_a = tl.advance(p_a, (0, BLOCK_K))
@@ -264,6 +314,8 @@ def mxfp8_block_scaled_matmul_triton(
     b: torch.Tensor,
     b_scale: torch.Tensor,
     output_dtype: torch.dtype,
+    a_scale_swizzled: bool = False,
+    b_scale_swizzled: bool = False,
 ) -> torch.Tensor:
     """
     Optimized MXFP8 block-scaled matrix multiplication using Triton.
@@ -272,9 +324,11 @@ def mxfp8_block_scaled_matmul_triton(
 
     Args:
         a: Input tensor of shape (M, K) in FP8 format
-        a_scale: Scale tensor of shape (M, K/32) in uint8 E8M0 format
+        a_scale: Scale tensor in uint8 E8M0 format. Row-major (M, K/32) or
+            swizzled (1D) layout when a_scale_swizzled=True.
         b: Weight tensor of shape (N, K) in FP8 format (note: not transposed)
-        b_scale: Scale tensor of shape (N, K/32) in uint8 E8M0 format
+        b_scale: Scale tensor in uint8 E8M0 format. Row-major (N, K/32) or
+            swizzled (1D) layout when b_scale_swizzled=True.
         output_dtype: Output data type (float32, float16, or bfloat16)
 
     Returns:
@@ -297,12 +351,25 @@ def mxfp8_block_scaled_matmul_triton(
         raise ValueError(f"Unsupported output dtype: {output_dtype}")
 
     scale_k = K // MXFP8_BLOCK_SIZE
-    assert a_scale.shape == (M, scale_k), (
-        f"a_scale shape {tuple(a_scale.shape)} != (M={M}, K/32={scale_k})"
-    )
-    assert b_scale.shape == (N, scale_k), (
-        f"b_scale shape {tuple(b_scale.shape)} != (N={N}, K/32={scale_k})"
-    )
+    if a_scale_swizzled:
+        expected = _mxfp8_swizzled_scale_numel(M, scale_k)
+        assert a_scale.ndim == 1 and a_scale.numel() == expected, (
+            f"a_scale swizzled size {a_scale.numel()} != expected {expected}"
+        )
+    else:
+        assert a_scale.shape == (M, scale_k), (
+            f"a_scale shape {tuple(a_scale.shape)} != (M={M}, K/32={scale_k})"
+        )
+
+    if b_scale_swizzled:
+        expected = _mxfp8_swizzled_scale_numel(N, scale_k)
+        assert b_scale.ndim == 1 and b_scale.numel() == expected, (
+            f"b_scale swizzled size {b_scale.numel()} != expected {expected}"
+        )
+    else:
+        assert b_scale.shape == (N, scale_k), (
+            f"b_scale shape {tuple(b_scale.shape)} != (N={N}, K/32={scale_k})"
+        )
 
     # Ensure contiguous tensors for optimal memory access
     if not a.is_contiguous():
@@ -319,6 +386,11 @@ def mxfp8_block_scaled_matmul_triton(
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
 
+    a_scale_stride_m = 0 if a_scale_swizzled else a_scale.stride(-2)
+    a_scale_stride_k = 0 if a_scale_swizzled else a_scale.stride(-1)
+    b_scale_stride_n = 0 if b_scale_swizzled else b_scale.stride(-2)
+    b_scale_stride_k = 0 if b_scale_swizzled else b_scale.stride(-1)
+
     _mxfp8_block_scaled_mm_kernel[grid](
         a,
         b,
@@ -334,11 +406,14 @@ def mxfp8_block_scaled_matmul_triton(
         b.stride(0),
         output.stride(-2),
         output.stride(-1),
-        a_scale.stride(-2),
-        a_scale.stride(-1),
-        b_scale.stride(-2),
-        b_scale.stride(-1),
+        a_scale_stride_m,
+        a_scale_stride_k,
+        b_scale_stride_n,
+        b_scale_stride_k,
         output_type=output_type,
+        AS_SWIZZLED=a_scale_swizzled,
+        BS_SWIZZLED=b_scale_swizzled,
+        USE_DOT_SCALED=False,
         # BLOCK_K, BLOCK_M, BLOCK_N, GROUP_SIZE_M come from autotune configs
     )
     return output
@@ -573,27 +648,31 @@ class _Mxfp8TritonLinearOp:
             is_sf_swizzled_layout=True,  # Swizzled for best accuracy
         )
 
-        input_scale_2d = unswizzle_mxfp8_scale(input_scale, M=M_padded, K=K)
-
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
         scale_k = K // MXFP8_BLOCK_SIZE
+        input_scale_swizzled = True
         if weight_scale_2d is not None:
             weight_scale_2d = weight_scale_2d[:N, :scale_k]
             if weight_scale_2d.dtype != MXFP8_SCALE_DTYPE:
                 weight_scale_2d = weight_scale_2d.view(MXFP8_SCALE_DTYPE)
+            weight_scale_swizzled = False
         elif weight_scale.ndim == 2:
             weight_scale_2d = weight_scale[:N, :scale_k]
+            weight_scale_swizzled = False
         else:
-            weight_scale_2d = unswizzle_mxfp8_scale(weight_scale, M=N, K=K)
+            weight_scale_2d = weight_scale
+            weight_scale_swizzled = True
 
         output = mxfp8_block_scaled_matmul_triton(
             input_mxfp8,
-            input_scale_2d,
+            input_scale,
             weight,
             weight_scale_2d,
             out_dtype,
+            a_scale_swizzled=input_scale_swizzled,
+            b_scale_swizzled=weight_scale_swizzled,
         )
 
         if M_padded != M_orig:
