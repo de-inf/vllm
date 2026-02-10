@@ -1606,12 +1606,14 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
-        # MXFP8 does not yet support MoE models
+        # MXFP8 does not yet support MoE quantization; fall back to unquantized MoE.
         if isinstance(layer, FusedMoE):
-            raise NotImplementedError(
-                "MXFP8 quantization does not yet support MoE models. "
-                "Please use FP8 or NVFP4 quantization for MoE models."
+            logger.warning_once(
+                "MXFP8 does not support MoE quantization; using unquantized "
+                "MoE for layer %s.",
+                prefix,
             )
+            return None
         return super().get_quant_method(layer, prefix)
 
     @classmethod
