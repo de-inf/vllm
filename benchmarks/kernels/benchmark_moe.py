@@ -371,7 +371,7 @@ def get_configs_compute_bound(
     if current_platform.is_rocm():
         param_ranges = get_rocm_tuning_space(use_fp16)
     else:
-        param_ranges = _get_param_ranges(use_fp16, fast_tune=fast_tune)
+        param_ranges = _get_param_ranges(fast_tune=fast_tune)
 
     keys, values = zip(*param_ranges.items())
     for config_values in product(*values):
@@ -690,7 +690,7 @@ def save_configs(
     )
     os.makedirs(save_dir, exist_ok=True)
     filename = os.path.join(save_dir, filename)
-    print(f"Writing best config to {filename}...")
+    print(f"Writing best config to:\n{filename}")
     with open(filename, "w") as f:
         json.dump({"triton_version": triton.__version__, **configs}, f, indent=4)
         f.write("\n")
