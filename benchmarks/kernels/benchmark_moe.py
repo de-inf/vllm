@@ -322,6 +322,47 @@ def get_rocm_tuning_space(use_fp16):
     return param_ranges
 
 
+def _get_param_ranges(fast_tune: bool = False) -> dict[str, list[int]]:
+    # Reduced search space for faster tuning.
+    # TODO(woosuk): Increase the search space and use a performance model to
+    # prune the search space.
+    fast_tune_ranges = None
+    if fast_tune:
+        device_name = _get_device_name()
+        fast_tune_ranges = _get_fast_tune_ranges(device_name)
+        if fast_tune_ranges:
+            print(f"Using fast-tune ranges for {device_name}")
+        else:
+            print(f"No fast-tune ranges found for {device_name}, using default ranges")
+
+    if fast_tune_ranges:
+        block_m_range = fast_tune_ranges["BLOCK_SIZE_M"]
+        block_n_range = fast_tune_ranges["BLOCK_SIZE_N"]
+        block_k_range = fast_tune_ranges["BLOCK_SIZE_K"]
+        group_m_range = fast_tune_ranges["GROUP_SIZE_M"]
+        num_warps_range = fast_tune_ranges["num_warps"]
+        num_stage_range = fast_tune_ranges["num_stages"]
+    else:
+        # Default ranges
+        block_m_range = [16, 32, 64, 128, 256]
+        block_n_range = [32, 64, 128, 256]
+        block_k_range = [64, 128, 256]
+        num_warps_range = [4, 8]
+        group_m_range = [1, 16, 32, 64]
+        num_stage_range = [2, 3, 4, 5]
+
+    param_ranges = {
+        "BLOCK_SIZE_M": block_m_range,
+        "BLOCK_SIZE_N": block_n_range,
+        "BLOCK_SIZE_K": block_k_range,
+        "GROUP_SIZE_M": group_m_range,
+        "num_warps": num_warps_range,
+        "num_stages": num_stage_range,
+    }
+
+    return param_ranges
+
+
 def get_configs_compute_bound(
     use_fp16, block_quant_shape, *, fast_tune: bool = False
 ) -> list[dict[str, int]]:
@@ -330,43 +371,7 @@ def get_configs_compute_bound(
     if current_platform.is_rocm():
         param_ranges = get_rocm_tuning_space(use_fp16)
     else:
-        # Reduced search space for faster tuning.
-        # TODO(woosuk): Increase the search space and use a performance model to
-        # prune the search space.
-        fast_tune_ranges = None
-        if fast_tune:
-            device_name = _get_device_name()
-            fast_tune_ranges = _get_fast_tune_ranges(device_name)
-            if fast_tune_ranges:
-                print(f"Using fast-tune ranges for {device_name}")
-            else:
-                print(
-                    f"No fast-tune ranges found for {device_name}, using default ranges"
-                )
-
-        if fast_tune_ranges:
-            block_m_range = fast_tune_ranges["BLOCK_SIZE_M"]
-            block_n_range = fast_tune_ranges["BLOCK_SIZE_N"]
-            block_k_range = fast_tune_ranges["BLOCK_SIZE_K"]
-            group_m_range = fast_tune_ranges["GROUP_SIZE_M"]
-            num_warps_range = fast_tune_ranges["num_warps"]
-            num_stage_range = fast_tune_ranges["num_stages"]
-        else:
-            block_m_range = [16, 32, 64, 128, 256]
-            block_n_range = [32, 64, 128, 256]
-            block_k_range = [64, 128, 256]
-            num_warps_range = [4, 8]
-            group_m_range = [1, 16, 32, 64]
-            num_stage_range = [2, 3, 4, 5]
-
-        param_ranges = {
-            "BLOCK_SIZE_M": block_m_range,
-            "BLOCK_SIZE_N": block_n_range,
-            "BLOCK_SIZE_K": block_k_range,
-            "GROUP_SIZE_M": group_m_range,
-            "num_warps": num_warps_range,
-            "num_stages": num_stage_range,
-        }
+        param_ranges = _get_param_ranges(use_fp16, fast_tune=fast_tune)
 
     keys, values = zip(*param_ranges.items())
     for config_values in product(*values):
