@@ -172,6 +172,25 @@ def _selective_scan_update_kernel(
         z_ptr += bos * stride_z_batch + pid_h * stride_z_head
     out_ptr += bos * stride_out_batch + pid_h * stride_out_head
 
+    # Alignment hints for common contiguous layouts.
+    if stride_state_dstate == 1:
+        tl.multiple_of(state_ptr, 16)
+        if not IS_SPEC_DECODING:
+            tl.multiple_of(dst_state_ptr, 16)
+    if stride_x_dim == 1:
+        tl.multiple_of(x_ptr, 16)
+        tl.multiple_of(out_ptr, 16)
+    if stride_dt_dim == 1:
+        tl.multiple_of(dt_ptr, 16)
+    if HAS_Z and stride_z_dim == 1:
+        tl.multiple_of(z_ptr, 16)
+    if HAS_D and stride_D_dim == 1:
+        tl.multiple_of(D_ptr, 16)
+    if stride_B_dstate == 1:
+        tl.multiple_of(B_ptr, 16)
+    if stride_C_dstate == 1:
+        tl.multiple_of(C_ptr, 16)
+
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     state_ptrs = state_ptr + (

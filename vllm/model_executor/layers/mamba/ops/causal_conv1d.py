@@ -145,6 +145,14 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
 
+    # Alignment hints for common contiguous layouts.
+    if stride_x_dim == 1:
+        tl.multiple_of(x_base, 16)
+    if stride_w_dim == 1:
+        tl.multiple_of(w_base, 16)
+    if stride_conv_state_dim == 1:
+        tl.multiple_of(conv_states_base, 16)
+
     # Does 2 things:
     # 1. READ prior-block init-state data - [done by every Triton programs]
     # 2. update conv_state with new data [only by the Triton program handles chunk_offset=0]
