@@ -119,6 +119,9 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     num_iters: int = 100,
+    use_cudagraph: bool = True,
+    graph_iters: int = 10,
+    warmup_iters: int = 5,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
 ) -> float:
@@ -264,33 +267,45 @@ def benchmark_config(
     run()
     torch.cuda.synchronize()
 
-    # Capture 10 invocations with CUDA graph
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(10):
-            run()
-    torch.cuda.synchronize()
-
-    # Warmup
-    for _ in range(5):
-        graph.replay()
-    torch.cuda.synchronize()
-
     start_event = torch.Event(enable_timing=True)
     end_event = torch.Event(enable_timing=True)
 
     latencies: list[float] = []
-    for i in range(num_iters):
-        prepare(i)
+    if use_cudagraph:
+        # Capture invocations with CUDA graph.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(graph_iters):
+                run()
         torch.cuda.synchronize()
 
-        start_event.record()
-        graph.replay()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
-    graph.reset()
+        # Warmup
+        for _ in range(warmup_iters):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        for i in range(num_iters):
+            prepare(i)
+            torch.cuda.synchronize()
+
+            start_event.record()
+            graph.replay()
+            end_event.record()
+            end_event.synchronize()
+            latencies.append(start_event.elapsed_time(end_event))
+        avg = sum(latencies) / (num_iters * graph_iters) * 1000  # us
+        graph.reset()
+    else:
+        for i in range(num_iters):
+            prepare(i)
+            torch.cuda.synchronize()
+
+            start_event.record()
+            run()
+            end_event.record()
+            end_event.synchronize()
+            latencies.append(start_event.elapsed_time(end_event))
+        avg = sum(latencies) / num_iters * 1000  # us
     return avg
 
 
@@ -524,6 +539,10 @@ class BenchmarkWorker:
         dtype: torch.dtype,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
+        num_iters: int,
+        use_cudagraph: bool,
+        graph_iters: int,
+        warmup_iters: int,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
     ) -> tuple[dict[str, int], float]:
@@ -562,7 +581,10 @@ class BenchmarkWorker:
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
-            num_iters=100,
+            num_iters=num_iters,
+            use_cudagraph=use_cudagraph,
+            graph_iters=graph_iters,
+            warmup_iters=warmup_iters,
             block_quant_shape=block_quant_shape,
             use_deep_gemm=use_deep_gemm,
         )
@@ -581,6 +603,10 @@ class BenchmarkWorker:
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
+        num_iters: int,
+        use_cudagraph: bool,
+        graph_iters: int,
+        warmup_iters: int,
     ) -> dict[str, int]:
         # local import to allow serialization by ray
         from vllm.platforms import current_platform
@@ -617,7 +643,10 @@ class BenchmarkWorker:
                         dtype,
                         use_fp8_w8a8,
                         use_int8_w8a16,
-                        num_iters=20,
+                        num_iters=num_iters,
+                        use_cudagraph=use_cudagraph,
+                        graph_iters=graph_iters,
+                        warmup_iters=warmup_iters,
                         block_quant_shape=block_quant_shape,
                         use_deep_gemm=use_deep_gemm,
                     )
@@ -840,20 +869,171 @@ def main(args: argparse.Namespace):
         os.environ["ROCR_VISIBLE_DEVICES"] = val
         del os.environ["HIP_VISIBLE_DEVICES"]
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+    use_cudagraph = not args.no_cudagraph
 
-    def _distribute(method: str, inputs: list[Any]) -> list[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+    if args.no_ray:
+
+        def _local_benchmark(
+            num_tokens: int,
+            num_experts: int,
+            shard_intermediate_size: int,
+            hidden_size: int,
+            topk: int,
+            dtype: torch.dtype,
+            use_fp8_w8a8: bool,
+            use_int8_w8a16: bool,
+            num_iters: int,
+            use_cudagraph: bool,
+            graph_iters: int,
+            warmup_iters: int,
+            block_quant_shape: list[int] | None,
+            use_deep_gemm: bool,
+        ) -> tuple[dict[str, int], float]:
+            torch.set_default_device("cuda")
+            torch.cuda.set_device(0)
+            set_random_seed(args.seed)
+            dtype_str = _get_config_dtype_str(
+                dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
+            )
+            block_n = block_quant_shape[0] if block_quant_shape else None
+            block_k = block_quant_shape[1] if block_quant_shape else None
+            op_config = get_moe_configs(
+                num_experts, shard_intermediate_size // 2, dtype_str, block_n, block_k
+            )
+            if op_config is None:
+                config = get_default_config(
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype_str,
+                    block_quant_shape,
+                )
+            else:
+                config = op_config[
+                    min(op_config.keys(), key=lambda x: abs(x - num_tokens))
+                ]
+            kernel_time = benchmark_config(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a16,
+                num_iters=num_iters,
+                use_cudagraph=use_cudagraph,
+                graph_iters=graph_iters,
+                warmup_iters=warmup_iters,
+                block_quant_shape=block_quant_shape,
+                use_deep_gemm=use_deep_gemm,
+            )
+            return config, kernel_time
+
+        def _local_tune(
+            num_tokens: int,
+            num_experts: int,
+            shard_intermediate_size: int,
+            hidden_size: int,
+            topk: int,
+            dtype: torch.dtype,
+            use_fp8_w8a8: bool,
+            use_int8_w8a16: bool,
+            search_space: list[dict[str, int]],
+            block_quant_shape: list[int],
+            use_deep_gemm: bool,
+            num_iters: int,
+            use_cudagraph: bool,
+            graph_iters: int,
+            warmup_iters: int,
+        ) -> dict[str, int]:
+            torch.set_default_device("cuda")
+            torch.cuda.set_device(0)
+            set_random_seed(args.seed)
+            best_config = None
+            best_time = float("inf")
+            if current_platform.is_rocm():
+                is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16)
+                search_space = prune_rocm_search_space(
+                    num_tokens,
+                    shard_intermediate_size,
+                    hidden_size,
+                    search_space,
+                    is_fp16,
+                    topk,
+                )
+            total = len(search_space)
+            report_every = max(1, total // 20)
+            start_time = time.time()
+            for idx, config in enumerate(search_space, start=1):
+                try:
+                    kernel_time = benchmark_config(
+                        config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a16,
+                        num_iters=num_iters,
+                        use_cudagraph=use_cudagraph,
+                        graph_iters=graph_iters,
+                        warmup_iters=warmup_iters,
+                        block_quant_shape=block_quant_shape,
+                        use_deep_gemm=use_deep_gemm,
+                    )
+                except triton.runtime.autotuner.OutOfResources:
+                    continue
+                if kernel_time < best_time:
+                    best_time = kernel_time
+                    best_config = config
+                if idx % report_every == 0 or idx == total:
+                    elapsed = time.time() - start_time
+                    print(
+                        f"Local tune progress: {idx}/{total} "
+                        f"({idx / total:.0%}) elapsed={elapsed:.1f}s",
+                        end="\r",
+                        flush=True,
+                    )
+                if (
+                    TRITON_CACHE_CLEAR_INTERVAL > 0
+                    and idx > 0
+                    and idx % TRITON_CACHE_CLEAR_INTERVAL == 0
+                ):
+                    clear_triton_cache()
+            clear_triton_cache()
+            print()
+            assert best_config is not None
+            return best_config
+
+        def _distribute(method: str, inputs: list[Any]) -> list[Any]:
+            outputs = []
+            for input_args in inputs:
+                if method == "tune":
+                    outputs.append(_local_tune(*input_args))
+                else:
+                    outputs.append(_local_benchmark(*input_args))
+            return outputs
+    else:
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+
+        def _distribute(method: str, inputs: list[Any]) -> list[Any]:
+            outputs = []
+            worker_idx = 0
+            for input_args in inputs:
+                worker = workers[worker_idx]
+                worker_method = getattr(worker, method)
+                output = worker_method.remote(*input_args)
+                outputs.append(output)
+                worker_idx = (worker_idx + 1) % num_gpus
+            return ray.get(outputs)
 
     tuning = args.tune or args.fast_tune
 
@@ -862,6 +1042,8 @@ def main(args: argparse.Namespace):
         search_space = get_configs_compute_bound(
             is_fp16, block_quant_shape, fast_tune=args.fast_tune
         )
+        if args.max_configs is not None and len(search_space) > args.max_configs:
+            search_space = search_space[: args.max_configs]
         print("-" * 80)
         print(f"Start tuning over {len(search_space)} configurations...")
         print("-" * 80)
@@ -886,6 +1068,10 @@ def main(args: argparse.Namespace):
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
+                    args.tune_iters,
+                    use_cudagraph,
+                    args.cudagraph_iters,
+                    args.cudagraph_warmup,
                 )
                 for batch_size in batch_sizes
             ],
@@ -921,6 +1107,10 @@ def main(args: argparse.Namespace):
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
+                    args.benchmark_iters,
+                    use_cudagraph,
+                    args.cudagraph_iters,
+                    args.cudagraph_warmup,
                     block_quant_shape,
                     use_deep_gemm,
                 )
@@ -958,6 +1148,39 @@ if __name__ == "__main__":
         "--fast-tune",
         action="store_true",
         help="Use trimmed tuning ranges based on GPU type (if available)",
+    )
+    parser.add_argument("--no-ray", action="store_true", help="Disable Ray.")
+    parser.add_argument(
+        "--no-cudagraph",
+        action="store_true",
+        help="Disable CUDA graph capture for faster tuning.",
+    )
+    parser.add_argument(
+        "--tune-iters", type=int, default=20, help="Iterations per config in tune."
+    )
+    parser.add_argument(
+        "--benchmark-iters",
+        type=int,
+        default=100,
+        help="Iterations per config in benchmark mode.",
+    )
+    parser.add_argument(
+        "--cudagraph-iters",
+        type=int,
+        default=10,
+        help="Number of iterations captured in a CUDA graph.",
+    )
+    parser.add_argument(
+        "--cudagraph-warmup",
+        type=int,
+        default=5,
+        help="Warmup replays for CUDA graph.",
+    )
+    parser.add_argument(
+        "--max-configs",
+        type=int,
+        default=None,
+        help="Cap the number of configs to tune.",
     )
     args = parser.parse_args()
 
