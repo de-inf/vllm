@@ -690,7 +690,9 @@ def save_configs(
     )
     os.makedirs(save_dir, exist_ok=True)
     filename = os.path.join(save_dir, filename)
+    print("-" * 80)
     print(f"Writing best config to:\n{filename}")
+    print("-" * 80)
     with open(filename, "w") as f:
         json.dump({"triton_version": triton.__version__, **configs}, f, indent=4)
         f.write("\n")
@@ -860,7 +862,9 @@ def main(args: argparse.Namespace):
         search_space = get_configs_compute_bound(
             is_fp16, block_quant_shape, fast_tune=args.fast_tune
         )
+        print("-" * 80)
         print(f"Start tuning over {len(search_space)} configurations...")
+        print("-" * 80)
         if use_deep_gemm:
             raise ValueError(
                 "Tuning with --use-deep-gemm is not supported as it only tunes Triton "
@@ -903,6 +907,7 @@ def main(args: argparse.Namespace):
         )
         end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
+        print("-" * 80)
     else:
         outputs = _distribute(
             "benchmark",
