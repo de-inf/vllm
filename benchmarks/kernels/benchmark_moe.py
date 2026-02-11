@@ -853,7 +853,9 @@ def main(args: argparse.Namespace):
             worker_idx = (worker_idx + 1) % num_gpus
         return ray.get(outputs)
 
-    if args.tune:
+    tuning = args.tune or args.fast_tune
+
+    if tuning:
         is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16)
         search_space = get_configs_compute_bound(
             is_fp16, block_quant_shape, fast_tune=args.fast_tune
