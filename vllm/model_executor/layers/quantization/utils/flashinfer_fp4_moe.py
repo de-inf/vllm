@@ -283,6 +283,7 @@ def flashinfer_trtllm_fp4_moe(
     topk_group: int | None,
     custom_routing_function: object | None,
     e_score_correction_bias: torch.Tensor | None,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """
     Apply FlashInfer TensorRT-LLM FP4 MoE kernel.
@@ -368,6 +369,7 @@ def flashinfer_trtllm_fp4_moe(
         routing_method_type=routing_method_type,
         do_finalize=True,
         activation_type=activation_type,
+        tune_max_num_tokens=tune_max_num_tokens,
     )[0]
 
     return out
@@ -381,6 +383,7 @@ def flashinfer_trtllm_fp4_routed_moe(
     top_k: int,
     activation: MoEActivation,
     global_num_experts: int,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """
     Apply FlashInfer TensorRT-LLM FP4 MoE kernel. Uses packed
@@ -451,6 +454,7 @@ def flashinfer_trtllm_fp4_routed_moe(
         routed_scaling_factor=None,
         routing_method_type=1,
         do_finalize=True,
+        tune_max_num_tokens=tune_max_num_tokens,
     )[0]
 
     return out

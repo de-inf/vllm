@@ -1234,6 +1234,15 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
+        # Keep FlashInfer MoE autotune bucketing aligned with vLLM capture regime.
+        from vllm.config import get_current_vllm_config
+
+        max_capture_size = (
+            get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        )
+        self.tune_max_num_tokens = (
+            max(max_capture_size, 1) if max_capture_size is not None else 8192
+        )
         # Select experts implementation.
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
@@ -1522,6 +1531,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             custom_routing_function=layer.custom_routing_function,
             e_score_correction_bias=layer.e_score_correction_bias,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
 
     def apply(
@@ -1545,6 +1555,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 top_k=layer.top_k,
                 activation=layer.activation,
                 global_num_experts=layer.global_num_experts,
+                tune_max_num_tokens=self.tune_max_num_tokens,
             )
         else:
             assert self.moe_mk is not None
