@@ -143,6 +143,17 @@ def reorder_w1w3_to_w3w1(
     )
 
 
+def _normalize_hidden_states_scale_for_trtllm_moe(
+    hidden_states: torch.Tensor,
+    hidden_states_scale_linear_fp4: torch.Tensor,
+) -> torch.Tensor:
+    """Keep hidden-state scale shape consistent between autotune and runtime."""
+    hidden_states_scale = hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn)
+    if hidden_states_scale.shape[:-1] == hidden_states.shape[:-1]:
+        return hidden_states_scale
+    return hidden_states_scale.reshape(*hidden_states.shape[:-1], -1)
+
+
 def prepare_static_weights_for_trtllm_fp4_moe(
     # args_dequant,
     # args,
@@ -337,15 +348,16 @@ def flashinfer_trtllm_fp4_moe(
 
     # Determine activation type
     activation_type = activation_to_flashinfer_int(layer.activation)
+    hidden_states_scale = _normalize_hidden_states_scale_for_trtllm_moe(
+        hidden_states_fp4, hidden_states_scale_linear_fp4
+    )
 
     # Call TRT-LLM FP4 block-scale MoE kernel
     out = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
         routing_logits=router_logits,
         routing_bias=e_score_correction_bias,
         hidden_states=hidden_states_fp4,
-        hidden_states_scale=hidden_states_scale_linear_fp4.view(
-            torch.float8_e4m3fn
-        ).flatten(),
+        hidden_states_scale=hidden_states_scale,
         gemm1_weights=layer.w13_weight.data,
         gemm1_weights_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
         gemm1_bias=None,
@@ -423,15 +435,16 @@ def flashinfer_trtllm_fp4_routed_moe(
         (hidden_states_fp4, hidden_states_scale_linear_fp4) = ops.scaled_fp4_quant(
             x, layer.a1_gscale, is_sf_swizzled_layout=False
         )
+    hidden_states_scale = _normalize_hidden_states_scale_for_trtllm_moe(
+        hidden_states_fp4, hidden_states_scale_linear_fp4
+    )
 
     # Call TRT-LLM FP4 block-scale MoE kernel
     out = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
         topk_ids=packed_tensor,
         routing_bias=None,
         hidden_states=hidden_states_fp4,
-        hidden_states_scale=hidden_states_scale_linear_fp4.view(
-            torch.float8_e4m3fn
-        ).flatten(),
+        hidden_states_scale=hidden_states_scale,
         gemm1_weights=layer.w13_weight.data,
         gemm1_weights_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
         gemm1_bias=None,
