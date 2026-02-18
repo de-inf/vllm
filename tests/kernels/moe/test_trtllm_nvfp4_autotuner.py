@@ -372,7 +372,7 @@ class TacticTracker:
     [True, False],
     ids=["2d_scale_cache_hit", "flat_scale_fallback"],
 )
-def test_large_batch_prefill(
+def test_trtllm_nvfp4_autotuner_tactic_selection(
     static_weights: dict[str, torch.Tensor], use_2d_scale: bool
 ) -> None:
     """
