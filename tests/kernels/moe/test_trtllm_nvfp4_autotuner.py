@@ -13,8 +13,8 @@ caused permanent autotuner cache misses and fallback to untuned tactics.
 This test:
   1. Creates minimal NVFP4 MoE weights/inputs
   2. Runs autotuning (populates the cache)
-  3. Runs inference with a FLATTENED scale (the bug) → expects fallback
-  4. Runs inference with a 2D scale (the fix) → expects cache hit
+  3. Runs inference with a FLATTENED scale (the bug) --> expects fallback
+  4. Runs inference with a 2D scale (the fix) --> expects cache hit
 """
 
 import logging
@@ -54,7 +54,6 @@ HIDDEN_SIZE = 1024  # hidden_size
 INTERMEDIATE_SIZE = 512  # intermediate_size (per-expert FFN width)
 TOP_K = 2
 SF_VEC_SIZE = 16  # NvFP4 scale-factor vector size
-TUNE_MAX_NUM_TOKENS = 128  # small so autotuning is fast
 
 
 def _calculate_fp4_global_scale(tensor: torch.Tensor) -> torch.Tensor:
@@ -96,7 +95,7 @@ def _prepare_trtllm_fp4_weights(
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
-) -> dict:
+) -> dict[str, torch.Tensor]:
     """
     Prepare shuffled FP4 weights + scales for the TRTLLM kernel,
     mimicking the offline weight-preparation pipeline.
@@ -106,24 +105,22 @@ def _prepare_trtllm_fp4_weights(
     cache: dict[torch.Size, torch.Tensor] = {}
 
     # Quantize with swizzled layout (for the kernel)
-    g1_fp4_sw, g1_sf_sw, g1_gsf = _quant_fp4_batched(gemm1_weights_orig, num_experts)
-    g2_fp4_sw, g2_sf_sw, g2_gsf = _quant_fp4_batched(gemm2_weights_orig, num_experts)
+    g1_fp4_sw, _, g1_gsf = _quant_fp4_batched(gemm1_weights_orig, num_experts)
+    g2_fp4_sw, _, g2_gsf = _quant_fp4_batched(gemm2_weights_orig, num_experts)
 
     # Quantize with linear layout (for scale-factor shuffling)
-    g1_fp4_lin, g1_sf_lin, _ = [], [], []
-    g2_fp4_lin, g2_sf_lin, _ = [], [], []
+    g1_sf_lin = []
+    g2_sf_lin = []
     for i in range(num_experts):
         gsf1 = _calculate_fp4_global_scale(gemm1_weights_orig[i])
         fp4, sf = fp4_quantize(
             gemm1_weights_orig[i].cuda(), gsf1.cuda(), SF_VEC_SIZE, False, False
         )
-        g1_fp4_lin.append(fp4)
         g1_sf_lin.append(sf)
         gsf2 = _calculate_fp4_global_scale(gemm2_weights_orig[i])
         fp4, sf = fp4_quantize(
             gemm2_weights_orig[i].cuda(), gsf2.cuda(), SF_VEC_SIZE, False, False
         )
-        g2_fp4_lin.append(fp4)
         g2_sf_lin.append(sf)
 
     g1_sf_lin_t = torch.stack(g1_sf_lin)
@@ -221,13 +218,9 @@ def _call_moe(
     hidden_states_fp4: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     routing_logits: torch.Tensor,
-    static: dict,
-    tune_max_num_tokens: int = TUNE_MAX_NUM_TOKENS,
-) -> torch.Tensor:
-    """
-    Call trtllm_fp4_block_scale_moe with the given hidden_states_scale shape.
-    The scale tensor shape is the key variable under test.
-    """
+    static: dict[str, torch.Tensor],
+    tune_max_num_tokens: int = 16384,
+) -> list[torch.Tensor]:
     return trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=None,
@@ -266,8 +259,7 @@ def _call_moe(
 
 
 @pytest.fixture(scope="module")
-def static_weights():
-    """Prepare shuffled FP4 weights once for the entire module."""
+def static_weights() -> dict[str, torch.Tensor]:
     torch.manual_seed(42)
     gemm1 = torch.randn(
         NUM_EXPERTS,
@@ -288,7 +280,9 @@ def static_weights():
     )
 
 
-def _make_inputs(num_tokens: int, static: dict):
+def _make_inputs(
+    num_tokens: int, static: dict[str, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create quantized hidden states + routing logits for *num_tokens*."""
     hidden = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
     gsf = static["hidden_sf_global"][0]  # scalar global scale
@@ -306,11 +300,11 @@ def _make_inputs(num_tokens: int, static: dict):
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _reset_autotuner():
+def _reset_autotuner() -> None:
     """Reset the singleton AutoTuner so each test starts with a clean cache."""
     tuner = AutoTuner.get()
     tuner.clear_cache()
@@ -325,7 +319,7 @@ class TacticTracker:
         self.calls: list[dict[str, Any]] = []
         self._orig_choose_one: Callable[..., Any] | None = None
 
-    def __enter__(self):
+    def __enter__(self) -> "TacticTracker":
         tuner = AutoTuner.get()
         self._orig_choose_one = tuner.choose_one
 
@@ -346,7 +340,7 @@ class TacticTracker:
                     }
                 )
                 logger.info(
-                    "[TacticTracker] %s → tactic=%s (%s)",
+                    "[TacticTracker] %s --> tactic=%s (%s)",
                     custom_op,
                     tactic,
                     "FALLBACK" if is_fallback else "TUNED [tile_N, config_N]",
@@ -356,7 +350,7 @@ class TacticTracker:
         tuner.choose_one = _patched_choose_one
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
         AutoTuner.get().choose_one = self._orig_choose_one
 
     @property
@@ -368,171 +362,9 @@ class TacticTracker:
         return sum(1 for c in self.calls if not c["is_fallback"])
 
 
-def test_flatten_scale_causes_fallback(static_weights):
-    """
-    Reproduce the original bug: when hidden_states_scale is passed as a
-    1D flattened tensor, the autotuner cache never hits because the
-    profiled shapes (2D) don't match the inference shapes (1D).
-    """
-    _reset_autotuner()
-    tuner = AutoTuner.get()
-
-    # --- Phase 1: Autotune (populates cache with 2D scale shapes) ----------
-    autotune_tokens = 32
-    fp4, sf_2d, logits = _make_inputs(autotune_tokens, static_weights)
-
-    with autotune():
-        _call_moe(fp4, sf_2d, logits, static_weights)
-    torch.cuda.synchronize()
-
-    # Verify autotuning populated the cache
-    assert len(tuner.profiling_cache) > 0, "Autotuner cache should not be empty"
-    logger.info("After autotuning: %d cached entries", len(tuner.profiling_cache))
-
-    # --- Phase 2: Inference with FLATTENED scale (the bug) -----------------
-    infer_tokens = 17  # intentionally non-power-of-2
-    fp4_i, sf_2d_i, logits_i = _make_inputs(infer_tokens, static_weights)
-
-    # Flatten the scale to 1D — this is what the old vLLM code did
-    sf_flat = sf_2d_i.flatten()
-    assert sf_flat.ndim == 1, "Scale must be 1D to reproduce the bug"
-
-    with TacticTracker() as tracker:
-        _call_moe(fp4_i, sf_flat, logits_i, static_weights)
-        torch.cuda.synchronize()
-
-    # Every call should have used the fallback tactic (-1)
-    assert tracker.num_fallbacks > 0, "Expected fallback tactics with 1D scale"
-    assert tracker.num_tuned == 0, "Expected NO tuned tactics with 1D scale"
-    logger.info(
-        "BUG REPRODUCED: flattened scale %s → %d fallback(s), 0 tuned. "
-        "dim 0 = %d instead of num_tokens = %d.",
-        sf_flat.shape,
-        tracker.num_fallbacks,
-        sf_flat.shape[0],
-        infer_tokens,
-    )
-
-
-def test_2d_scale_gets_cache_hit(static_weights):
-    """
-    Verify the fix: when hidden_states_scale is kept as 2D
-    [num_tokens, hidden_size // 16], the autotuner cache hits correctly.
-    """
-    _reset_autotuner()
-    tuner = AutoTuner.get()
-
-    # --- Phase 1: Autotune -------------------------------------------------
-    autotune_tokens = 32
-    fp4, sf_2d, logits = _make_inputs(autotune_tokens, static_weights)
-
-    with autotune():
-        _call_moe(fp4, sf_2d, logits, static_weights)
-    torch.cuda.synchronize()
-
-    cache_size_after_tune = len(tuner.profiling_cache)
-    assert cache_size_after_tune > 0, "Autotuner cache should not be empty"
-    logger.info(
-        "After autotuning: %d cached entries",
-        cache_size_after_tune,
-    )
-
-    # --- Phase 2: Inference with 2D scale (the fix) ------------------------
-    # Test a range of token counts to verify bucketing works
-    test_token_counts = [1, 7, 16, 32, 64]
-
-    with TacticTracker() as tracker:
-        for num_tokens in test_token_counts:
-            fp4_i, sf_2d_i, logits_i = _make_inputs(num_tokens, static_weights)
-
-            # Scale is 2D: [num_tokens, hidden_size // 16]
-            assert sf_2d_i.ndim == 2, f"Scale must be 2D, got {sf_2d_i.ndim}D"
-            assert sf_2d_i.shape[0] == num_tokens
-
-            result = _call_moe(fp4_i, sf_2d_i, logits_i, static_weights)
-            torch.cuda.synchronize()
-
-            # Result should be valid
-            assert result is not None
-            assert result[0].shape[0] == num_tokens
-
-    # All calls should have used tuned tactics (cache hit)
-    assert tracker.num_tuned == len(test_token_counts), (
-        f"Expected {len(test_token_counts)} tuned calls, "
-        f"got {tracker.num_tuned} tuned and {tracker.num_fallbacks} fallbacks"
-    )
-    assert tracker.num_fallbacks == 0, (
-        f"Got {tracker.num_fallbacks} fallback(s) — cache miss during inference"
-    )
-
-    for num_tokens, call in zip(test_token_counts, tracker.calls):
-        logger.info(
-            "num_tokens=%d: tactic=%s (%s)",
-            num_tokens,
-            call["tactic"],
-            "TUNED" if not call["is_fallback"] else "FALLBACK",
-        )
-
-    # Cache size should NOT have grown (no new profiling during inference)
-    assert len(tuner.profiling_cache) == cache_size_after_tune, (
-        f"Cache grew from {cache_size_after_tune} to "
-        f"{len(tuner.profiling_cache)} — unexpected new profiling entries."
-    )
-    logger.info(
-        "VERIFIED: all %d inference calls used tuned tactics "
-        "(cache size unchanged at %d)",
-        tracker.num_tuned,
-        cache_size_after_tune,
-    )
-
-
-def test_flatten_vs_2d_side_by_side(static_weights):
-    """
-    Direct side-by-side comparison: same data, flatten vs 2D, checking
-    whether the autotuner returns tactic -1 (fallback) or a tuned tactic.
-    """
-    _reset_autotuner()
-    tuner = AutoTuner.get()
-
-    # Autotune
-    fp4, sf_2d, logits = _make_inputs(32, static_weights)
-    with autotune():
-        _call_moe(fp4, sf_2d, logits, static_weights)
-    torch.cuda.synchronize()
-
-    initial_cache = dict(tuner.profiling_cache)  # snapshot
-    assert len(initial_cache) > 0
-
-    # --- Inference: 2D scale (fixed) ---
-    fp4_i, sf_2d_i, logits_i = _make_inputs(16, static_weights)
-    with TacticTracker() as tracker_2d:
-        _call_moe(fp4_i, sf_2d_i, logits_i, static_weights)
-        torch.cuda.synchronize()
-
-    assert tracker_2d.num_tuned == 1, "2D scale should get a cache hit"
-    assert tracker_2d.num_fallbacks == 0, "2D scale should not fall back"
-    tactic_2d = tracker_2d.calls[0]["tactic"]
-
-    # --- Inference: flattened scale (buggy) ---
-    sf_flat = sf_2d_i.flatten()
-    with TacticTracker() as tracker_flat:
-        _call_moe(fp4_i, sf_flat, logits_i, static_weights)
-        torch.cuda.synchronize()
-
-    assert tracker_flat.num_fallbacks == 1, "Flattened scale should fall back"
-    assert tracker_flat.num_tuned == 0, "Flattened scale should not get a hit"
-    tactic_flat = tracker_flat.calls[0]["tactic"]
-
-    assert tactic_flat == -1, f"Fallback tactic should be -1, got {tactic_flat}"
-    assert tactic_2d != -1, f"Tuned tactic should not be -1, got {tactic_2d}"
-
-    logger.info(
-        "Side-by-side comparison:\n"
-        "  - 2D scale:       tactic=%s (TUNED)\n"
-        "  - Flattened scale: tactic=%s (FALLBACK)",
-        tactic_2d,
-        tactic_flat,
-    )
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -540,17 +372,19 @@ def test_flatten_vs_2d_side_by_side(static_weights):
     [True, False],
     ids=["2d_scale_cache_hit", "flat_scale_fallback"],
 )
-def test_large_batch_prefill(static_weights, use_2d_scale: bool):
+def test_large_batch_prefill(
+    static_weights: dict[str, torch.Tensor], use_2d_scale: bool
+) -> None:
     """
     Simulate a realistic prefill workload: batch_size=64 with 8000 tokens
     per prompt.  In vLLM this is chunked, so the MoE kernel sees batches
-    up to ``max_num_batched_tokens`` (commonly 8192–16384).
+    up to max_num_batched_tokens (commonly 8192 to 16384).
 
     Parametrized:
-      - use_2d_scale=True  → 2D scale [num_tokens, hidden_size//16] (fix)
-                              → all calls should use tuned tactics
-      - use_2d_scale=False → 1D flattened scale (bug)
-                              → all calls should fall back to tactic -1
+      - use_2d_scale=True  --> 2D scale [num_tokens, hidden_size//16] (fix)
+                              --> all calls should use tuned tactics
+      - use_2d_scale=False --> 1D flattened scale (bug)
+                              --> all calls should fall back to tactic -1
     """
     _reset_autotuner()
     tuner = AutoTuner.get()
@@ -596,7 +430,7 @@ def test_large_batch_prefill(static_weights, use_2d_scale: bool):
         for num_tokens in test_token_counts:
             fp4_i, sf_2d_i, logits_i = _make_inputs(num_tokens, static_weights)
 
-            # 2D (fix) → cache hit; 1D flatten (bug) → fallback tactic
+            # 2D (fix) --> cache hit; 1D flatten (bug) --> fallback tactic
             scale = sf_2d_i if use_2d_scale else sf_2d_i.flatten()
 
             result = _call_moe(
@@ -613,7 +447,7 @@ def test_large_batch_prefill(static_weights, use_2d_scale: bool):
 
     for num_tokens, call in zip(test_token_counts, tracker.calls):
         logger.info(
-            "num_tokens=%d: scale_shape=%s → tactic=%s (%s)",
+            "num_tokens=%d: scale_shape=%s --> tactic=%s (%s)",
             num_tokens,
             "2D" if use_2d_scale else "1D-flat",
             call["tactic"],
