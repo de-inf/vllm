@@ -349,7 +349,7 @@ class TacticTracker:
                     "[TacticTracker] %s → tactic=%s (%s)",
                     custom_op,
                     tactic,
-                    "FALLBACK" if is_fallback else "TUNED",
+                    "FALLBACK" if is_fallback else "TUNED [tile_N, config_N]",
                 )
             return runner, tactic
 
