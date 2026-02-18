@@ -222,6 +222,7 @@ def _call_moe(
     hidden_states_scale: torch.Tensor,
     routing_logits: torch.Tensor,
     static: dict,
+    tune_max_num_tokens: int = TUNE_MAX_NUM_TOKENS,
 ) -> torch.Tensor:
     """
     Call trtllm_fp4_block_scale_moe with the given hidden_states_scale shape.
@@ -255,7 +256,7 @@ def _call_moe(
         routing_method_type=RoutingMethodType.Renormalize,
         do_finalize=True,
         activation_type=ActivationType.Swiglu,
-        tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
 
@@ -532,3 +533,112 @@ def test_flatten_vs_2d_side_by_side(static_weights):
         tactic_2d,
         tactic_flat,
     )
+
+
+@pytest.mark.parametrize(
+    "use_2d_scale",
+    [True, False],
+    ids=["2d_scale_cache_hit", "flat_scale_fallback"],
+)
+def test_large_batch_prefill(static_weights, use_2d_scale: bool):
+    """
+    Simulate a realistic prefill workload: batch_size=64 with 8000 tokens
+    per prompt.  In vLLM this is chunked, so the MoE kernel sees batches
+    up to ``max_num_batched_tokens`` (commonly 8192–16384).
+
+    Parametrized:
+      - use_2d_scale=True  → 2D scale [num_tokens, hidden_size//16] (fix)
+                              → all calls should use tuned tactics
+      - use_2d_scale=False → 1D flattened scale (bug)
+                              → all calls should fall back to tactic -1
+    """
+    _reset_autotuner()
+    tuner = AutoTuner.get()
+
+    large_tune_max = 16384  # covers prefill-sized batches
+
+    # --- Phase 1: Autotune at the max batch size ---------------------------
+    # Always autotune with 2D scale (the correct shape)
+    autotune_tokens = 8192
+    fp4, sf_2d, logits = _make_inputs(autotune_tokens, static_weights)
+
+    with autotune():
+        _call_moe(
+            fp4,
+            sf_2d,
+            logits,
+            static_weights,
+            tune_max_num_tokens=large_tune_max,
+        )
+    torch.cuda.synchronize()
+
+    cache_size_after_tune = len(tuner.profiling_cache)
+    assert cache_size_after_tune > 0
+    logger.info(
+        "After autotuning (tune_max=%d): %d cached entries",
+        large_tune_max,
+        cache_size_after_tune,
+    )
+
+    # --- Phase 2: Inference at various realistic token counts --------------
+    # Simulate: 64 seqs × 8000 toks chunked into scheduler batches,
+    # plus smaller decode batches.
+    test_token_counts = [
+        64,  # pure decode: 64 seqs × 1 token
+        128,  # small prefill chunk
+        1024,  # medium prefill chunk
+        4096,  # large prefill chunk
+        8000,  # full prefill batch (non-power-of-2)
+        8192,  # full prefill batch (power-of-2)
+    ]
+
+    with TacticTracker() as tracker:
+        for num_tokens in test_token_counts:
+            fp4_i, sf_2d_i, logits_i = _make_inputs(num_tokens, static_weights)
+
+            # 2D (fix) → cache hit; 1D flatten (bug) → fallback tactic
+            scale = sf_2d_i if use_2d_scale else sf_2d_i.flatten()
+
+            result = _call_moe(
+                fp4_i,
+                scale,
+                logits_i,
+                static_weights,
+                tune_max_num_tokens=large_tune_max,
+            )
+            torch.cuda.synchronize()
+
+            assert result is not None
+            assert result[0].shape[0] == num_tokens
+
+    for num_tokens, call in zip(test_token_counts, tracker.calls):
+        logger.info(
+            "num_tokens=%d: scale_shape=%s → tactic=%s (%s)",
+            num_tokens,
+            "2D" if use_2d_scale else "1D-flat",
+            call["tactic"],
+            "TUNED" if not call["is_fallback"] else "FALLBACK",
+        )
+
+    if use_2d_scale:
+        # All calls should use tuned tactics (cache hit)
+        assert tracker.num_fallbacks == 0, (
+            f"Got {tracker.num_fallbacks} fallback(s) with 2D scale — "
+            f"expected all cache hits"
+        )
+        assert tracker.num_tuned == len(test_token_counts)
+        logger.info(
+            "VERIFIED (2D scale): all %d calls used tuned tactics",
+            tracker.num_tuned,
+        )
+    else:
+        # All calls should fall back (cache miss due to shape mismatch)
+        assert tracker.num_tuned == 0, (
+            f"Got {tracker.num_tuned} tuned call(s) with flattened scale — "
+            f"expected all fallbacks"
+        )
+        assert tracker.num_fallbacks == len(test_token_counts)
+        logger.info(
+            "VERIFIED (1D flat scale): all %d calls used fallback tactic -1",
+            tracker.num_fallbacks,
+        )
