@@ -18,6 +18,8 @@ This test:
 """
 
 import logging
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import torch
@@ -314,6 +316,57 @@ def _reset_autotuner():
     tuner.reset_statistics()
 
 
+class TacticTracker:
+    """Context manager that monkey-patches AutoTuner.choose_one to record
+    the (tactic, is_cache_hit) for every non-tuning call."""
+
+    def __init__(self):
+        self.calls: list[dict[str, Any]] = []
+        self._orig_choose_one: Callable[..., Any] | None = None
+
+    def __enter__(self):
+        tuner = AutoTuner.get()
+        self._orig_choose_one = tuner.choose_one
+
+        tracker = self  # capture for closure
+
+        def _patched_choose_one(custom_op, runners, tuning_config, inputs, **kw):
+            assert tracker._orig_choose_one is not None
+            runner, tactic = tracker._orig_choose_one(
+                custom_op, runners, tuning_config, inputs, **kw
+            )
+            if not tuner.is_tuning_mode:
+                is_fallback = tactic == -1
+                tracker.calls.append(
+                    {
+                        "op": custom_op,
+                        "tactic": tactic,
+                        "is_fallback": is_fallback,
+                    }
+                )
+                logger.info(
+                    "[TacticTracker] %s → tactic=%s (%s)",
+                    custom_op,
+                    tactic,
+                    "FALLBACK" if is_fallback else "TUNED",
+                )
+            return runner, tactic
+
+        tuner.choose_one = _patched_choose_one
+        return self
+
+    def __exit__(self, *exc):
+        AutoTuner.get().choose_one = self._orig_choose_one
+
+    @property
+    def num_fallbacks(self) -> int:
+        return sum(1 for c in self.calls if c["is_fallback"])
+
+    @property
+    def num_tuned(self) -> int:
+        return sum(1 for c in self.calls if not c["is_fallback"])
+
+
 def test_flatten_scale_causes_fallback(static_weights):
     """
     Reproduce the original bug: when hidden_states_scale is passed as a
@@ -343,34 +396,18 @@ def test_flatten_scale_causes_fallback(static_weights):
     sf_flat = sf_2d_i.flatten()
     assert sf_flat.ndim == 1, "Scale must be 1D to reproduce the bug"
 
-    _call_moe(fp4_i, sf_flat, logits_i, static_weights)
-    torch.cuda.synchronize()
+    with TacticTracker() as tracker:
+        _call_moe(fp4_i, sf_flat, logits_i, static_weights)
+        torch.cuda.synchronize()
 
-    # The flattened shape causes a cache miss → tactic should be -1 (fallback)
-    # We detect this by inspecting the input shapes that would be used
-    # for cache key generation.
-    input_shapes = tuple(
-        t.size() if isinstance(t, torch.Tensor) else torch.Size((0,))
-        for t in [
-            torch.empty(infer_tokens, HIDDEN_SIZE),  # output
-            logits_i,  # routing_logits
-            torch.empty(infer_tokens, TOP_K, dtype=torch.int32),  # topk_ids
-            torch.empty(infer_tokens, TOP_K),  # expert_weights
-            fp4_i,  # hidden_states
-            sf_flat,  # hidden_states_scale (1D!)
-        ]
-    )
+    # Every call should have used the fallback tactic (-1)
+    assert tracker.num_fallbacks > 0, "Expected fallback tactics with 1D scale"
+    assert tracker.num_tuned == 0, "Expected NO tuned tactics with 1D scale"
     logger.info(
-        "Flattened scale inference input shapes: %s",
-        [str(s) for s in input_shapes],
-    )
-    # The 6th tensor is 1D — its dim 0 != num_tokens, so the bucket
-    # won't match the profiled 2D shape where dim 0 = num_tokens.
-    # This is the bug: permanent cache miss.
-    logger.info(
-        "BUG REPRODUCED: flattened scale tensor shape %s has dim 0 = %d "
-        "instead of num_tokens = %d — autotuner cache will never match.",
+        "BUG REPRODUCED: flattened scale %s → %d fallback(s), 0 tuned. "
+        "dim 0 = %d instead of num_tokens = %d.",
         sf_flat.shape,
+        tracker.num_fallbacks,
         sf_flat.shape[0],
         infer_tokens,
     )
@@ -403,34 +440,47 @@ def test_2d_scale_gets_cache_hit(static_weights):
     # Test a range of token counts to verify bucketing works
     test_token_counts = [1, 7, 16, 32, 64]
 
-    for num_tokens in test_token_counts:
-        fp4_i, sf_2d_i, logits_i = _make_inputs(num_tokens, static_weights)
+    with TacticTracker() as tracker:
+        for num_tokens in test_token_counts:
+            fp4_i, sf_2d_i, logits_i = _make_inputs(num_tokens, static_weights)
 
-        # Scale is 2D: [num_tokens, hidden_size // 16]
-        assert sf_2d_i.ndim == 2, f"Scale must be 2D, got {sf_2d_i.ndim}D"
-        assert sf_2d_i.shape[0] == num_tokens
+            # Scale is 2D: [num_tokens, hidden_size // 16]
+            assert sf_2d_i.ndim == 2, f"Scale must be 2D, got {sf_2d_i.ndim}D"
+            assert sf_2d_i.shape[0] == num_tokens
 
-        result = _call_moe(fp4_i, sf_2d_i, logits_i, static_weights)
-        torch.cuda.synchronize()
+            result = _call_moe(fp4_i, sf_2d_i, logits_i, static_weights)
+            torch.cuda.synchronize()
 
-        # Result should be valid
-        assert result is not None
-        assert result[0].shape[0] == num_tokens
+            # Result should be valid
+            assert result is not None
+            assert result[0].shape[0] == num_tokens
+
+    # All calls should have used tuned tactics (cache hit)
+    assert tracker.num_tuned == len(test_token_counts), (
+        f"Expected {len(test_token_counts)} tuned calls, "
+        f"got {tracker.num_tuned} tuned and {tracker.num_fallbacks} fallbacks"
+    )
+    assert tracker.num_fallbacks == 0, (
+        f"Got {tracker.num_fallbacks} fallback(s) — cache miss during inference"
+    )
+
+    for num_tokens, call in zip(test_token_counts, tracker.calls):
         logger.info(
-            "num_tokens=%d: inference succeeded with 2D scale %s",
+            "num_tokens=%d: tactic=%s (%s)",
             num_tokens,
-            sf_2d_i.shape,
+            call["tactic"],
+            "TUNED" if not call["is_fallback"] else "FALLBACK",
         )
 
     # Cache size should NOT have grown (no new profiling during inference)
     assert len(tuner.profiling_cache) == cache_size_after_tune, (
         f"Cache grew from {cache_size_after_tune} to "
-        f"{len(tuner.profiling_cache)} — unexpected new profiling entries. "
-        "This suggests cache misses during inference."
+        f"{len(tuner.profiling_cache)} — unexpected new profiling entries."
     )
     logger.info(
-        "VERIFIED: all inference calls hit the autotuner cache "
+        "VERIFIED: all %d inference calls used tuned tactics "
         "(cache size unchanged at %d)",
+        tracker.num_tuned,
         cache_size_after_tune,
     )
 
@@ -454,29 +504,31 @@ def test_flatten_vs_2d_side_by_side(static_weights):
 
     # --- Inference: 2D scale (fixed) ---
     fp4_i, sf_2d_i, logits_i = _make_inputs(16, static_weights)
-    _call_moe(fp4_i, sf_2d_i, logits_i, static_weights)
-    torch.cuda.synchronize()
+    with TacticTracker() as tracker_2d:
+        _call_moe(fp4_i, sf_2d_i, logits_i, static_weights)
+        torch.cuda.synchronize()
 
-    cache_after_2d = len(tuner.profiling_cache)
-    assert cache_after_2d == len(initial_cache), (
-        "Cache should not grow with 2D scale (cache hit expected)"
-    )
+    assert tracker_2d.num_tuned == 1, "2D scale should get a cache hit"
+    assert tracker_2d.num_fallbacks == 0, "2D scale should not fall back"
+    tactic_2d = tracker_2d.calls[0]["tactic"]
 
     # --- Inference: flattened scale (buggy) ---
     sf_flat = sf_2d_i.flatten()
-    _call_moe(fp4_i, sf_flat, logits_i, static_weights)
-    torch.cuda.synchronize()
+    with TacticTracker() as tracker_flat:
+        _call_moe(fp4_i, sf_flat, logits_i, static_weights)
+        torch.cuda.synchronize()
 
-    # With the flattened scale, the autotuner can't find a match.
-    # The cache should still be the same size (no new profiling in
-    # inference mode), but the kernel ran with fallback tactic.
-    cache_after_flat = len(tuner.profiling_cache)
-    assert cache_after_flat == len(initial_cache), (
-        "Cache should not grow during inference regardless of scale shape"
-    )
+    assert tracker_flat.num_fallbacks == 1, "Flattened scale should fall back"
+    assert tracker_flat.num_tuned == 0, "Flattened scale should not get a hit"
+    tactic_flat = tracker_flat.calls[0]["tactic"]
+
+    assert tactic_flat == -1, f"Fallback tactic should be -1, got {tactic_flat}"
+    assert tactic_2d != -1, f"Tuned tactic should not be -1, got {tactic_2d}"
 
     logger.info(
-        "Side-by-side test passed:\n"
-        "  - 2D scale:      cache hit (tuned tactic used)\n"
-        "  - Flattened scale: cache miss (fallback tactic -1 used)"
+        "Side-by-side comparison:\n"
+        "  - 2D scale:       tactic=%s (TUNED)\n"
+        "  - Flattened scale: tactic=%s (FALLBACK)",
+        tactic_2d,
+        tactic_flat,
     )
