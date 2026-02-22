@@ -569,10 +569,10 @@ if has_flashinfer():
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
         return mm_mxfp8_(
-            a=A,
-            b=B,
-            a_descale=A_scale,
-            b_descale=B_scale,
+            A,
+            B,
+            A_scale,
+            B_scale,
             out=None,
             out_dtype=out_dtype,
             backend=backend,
