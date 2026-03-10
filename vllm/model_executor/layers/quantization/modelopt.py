@@ -1551,7 +1551,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        self.backend: Mxfp8LinearBackend = Mxfp8LinearBackend.FLASHINFER_CUTLASS
+        self.backend: Mxfp8LinearBackend = Mxfp8LinearBackend.FLASHINFER_CUTE_DSL
         self.mxfp8_linear_op = Mxfp8LinearOp(backend=self.backend)
         logger.info_once("Using %s backend for MXFP8 GEMM", self.backend.value)
 
@@ -1670,7 +1670,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             self._process_weights_after_loading_scale_2d(layer)
             return
 
-        assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
+        # Flashinfer CUTLASS or CUTE-DSL
         # Swizzled layout is required for Flashinfer CUTLASS
         self._process_weights_after_loading_scale_1d(layer)
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
+from typing import Literal
 
 import torch
 
@@ -15,6 +16,7 @@ logger = init_logger(__name__)
 class Mxfp8LinearBackend(Enum):
     EMULATION = "emulation"
     FLASHINFER_CUTLASS = "flashinfer-cutlass"
+    FLASHINFER_CUTE_DSL = "flashinfer-cute-dsl"
 
 
 # MXFP8 constants
@@ -159,13 +161,14 @@ class Mxfp8LinearOp:
         output = torch.nn.functional.linear(input, weight_bf16, bias)
         return output.to(out_dtype)
 
-    def _apply_flashinfer_cutlass(
+    def _apply_flashinfer(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
+        backend: Literal["cutlass", "cute-dsl"] = "cutlass",
     ) -> torch.Tensor:
         N, K = weight.shape
 
@@ -207,7 +210,7 @@ class Mxfp8LinearOp:
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cutlass",
+            backend=backend,
         )
 
         if M_padded != M_orig:
@@ -230,7 +233,10 @@ class Mxfp8LinearOp:
         if self.backend == Mxfp8LinearBackend.EMULATION:
             return self._apply_emulation(input, weight, weight_scale, out_dtype, bias)
 
-        assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
-        return self._apply_flashinfer_cutlass(
-            input, weight, weight_scale, out_dtype, bias
+        fi_backend: Literal["cutlass", "cute-dsl"] = "cutlass"
+        if self.backend == Mxfp8LinearBackend.FLASHINFER_CUTE_DSL:
+            fi_backend = "cute-dsl"
+
+        return self._apply_flashinfer(
+            input, weight, weight_scale, out_dtype, bias, backend=fi_backend
         )
