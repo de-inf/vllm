@@ -22,6 +22,93 @@ MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
 
+_SHUFFLE_ROW_MAP_16 = torch.tensor(
+    [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15], dtype=torch.long
+)
+_SHUFFLE_ROW_MAP_32 = torch.tensor(
+    [
+        0,
+        1,
+        8,
+        9,
+        16,
+        17,
+        24,
+        25,
+        2,
+        3,
+        10,
+        11,
+        18,
+        19,
+        26,
+        27,
+        4,
+        5,
+        12,
+        13,
+        20,
+        21,
+        28,
+        29,
+        6,
+        7,
+        14,
+        15,
+        22,
+        23,
+        30,
+        31,
+    ],
+    dtype=torch.long,
+)
+_SHUFFLE_ROW_INDEX_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+_GATED_REORDER_ROW_INDEX_CACHE: dict[int, torch.Tensor] = {}
+
+
+def get_shuffle_row_indices(num_rows: int, epilogue_tile_m: int) -> torch.Tensor:
+    shuffle_block_size = 32 if epilogue_tile_m % 128 == 0 else 16
+    if num_rows % shuffle_block_size != 0:
+        raise ValueError(
+            f"Expected rows to be a multiple of {shuffle_block_size}, got {num_rows}."
+        )
+
+    key = (num_rows, shuffle_block_size)
+    cached = _SHUFFLE_ROW_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    row_map = _SHUFFLE_ROW_MAP_32 if shuffle_block_size == 32 else _SHUFFLE_ROW_MAP_16
+    old_rows = torch.arange(num_rows, dtype=torch.long)
+    block_idx = old_rows // shuffle_block_size
+    row_in_block = old_rows % shuffle_block_size
+    mapped_row_in_block = row_map[row_in_block]
+    new_rows = block_idx * shuffle_block_size + mapped_row_in_block
+    row_indices = torch.empty(num_rows, dtype=torch.long)
+    row_indices[new_rows] = old_rows
+    _SHUFFLE_ROW_INDEX_CACHE[key] = row_indices
+    return row_indices
+
+
+def get_gated_reorder_row_indices(num_rows: int) -> torch.Tensor:
+    if num_rows % 2 != 0:
+        raise ValueError(
+            f"Expected even number of rows for gated reorder, got {num_rows}."
+        )
+
+    cached = _GATED_REORDER_ROW_INDEX_CACHE.get(num_rows)
+    if cached is not None:
+        return cached
+
+    row_indices = torch.arange(num_rows, dtype=torch.long)
+    top = row_indices[: (num_rows + 1) // 2]
+    bottom = row_indices[(num_rows + 1) // 2 :]
+    permuted = torch.empty_like(row_indices)
+    permuted[0::2] = top
+    permuted[1::2] = bottom
+    _GATED_REORDER_ROW_INDEX_CACHE[num_rows] = permuted
+    return permuted
+
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
     """Swizzle MXFP8 scales from row-major 2D to F8_128x4 layout."""

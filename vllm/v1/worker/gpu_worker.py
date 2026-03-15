@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
@@ -64,6 +65,7 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -366,7 +368,19 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
+            t0 = time.time()
+            logger.warning(
+                "MXFP8 profile probe: entering profile_run "
+                "(pid=%s, kv_cache_memory_bytes=%s)",
+                os.getpid(),
+                kv_cache_memory_bytes,
+            )
             self.model_runner.profile_run()
+            logger.warning(
+                "MXFP8 profile probe: profile_run finished (pid=%s, elapsed=%.3fs)",
+                os.getpid(),
+                time.time() - t0,
+            )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -389,7 +403,18 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            t0 = time.time()
+            logger.warning(
+                "MXFP8 profile probe: entering profile_run (pid=%s, max_num_tokens=%s)",
+                os.getpid(),
+                self.model_runner.max_num_tokens,
+            )
             self.model_runner.profile_run()
+            logger.warning(
+                "MXFP8 profile probe: profile_run finished (pid=%s, elapsed=%.3fs)",
+                os.getpid(),
+                time.time() - t0,
+            )
 
             profile_torch_peak = current_platform.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0

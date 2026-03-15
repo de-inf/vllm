@@ -69,6 +69,8 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
     Mxfp8LinearBackend,
     Mxfp8LinearOp,
+    get_gated_reorder_row_indices,
+    get_shuffle_row_indices,
     mxfp8_e4m3_quantize,
     swizzle_mxfp8_scale,
 )
@@ -103,6 +105,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
 
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
@@ -1826,9 +1829,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
     def _shuffle_weights_for_trtllm(self, layer: torch.nn.Module) -> None:
         """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
         from flashinfer import (
-            reorder_rows_for_gated_act_gemm,
-            shuffle_matrix_a,
-            shuffle_matrix_sf_a,
+            block_scale_interleave,
         )
 
         epilogue_tile_m = 128
@@ -1843,69 +1844,49 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             # gated projection as W13, so convert once before shuffling.
             w13_weight = swap_w13_to_w31(w13_weight)
             w13_scale = swap_w13_to_w31(w13_scale)
+        w13_rows = intermediate_size_factor * layer.intermediate_size_per_partition
+        w2_rows = layer.hidden_size
+        row_idx_w13 = get_shuffle_row_indices(w13_rows, epilogue_tile_m).to(
+            w13_weight.device
+        )
+        row_idx_w2 = get_shuffle_row_indices(w2_rows, epilogue_tile_m).to(
+            w13_weight.device
+        )
 
-        w13_weight_shuffled = []
-        w2_weight_shuffled = []
-        w13_scale_shuffled = []
-        w2_scale_shuffled = []
-        for i in range(num_experts):
-            w13_i = w13_weight[i].reshape(
-                intermediate_size_factor * layer.intermediate_size_per_partition, -1
-            )
-            w13_sf_i = w13_scale[i].reshape(
-                intermediate_size_factor * layer.intermediate_size_per_partition, -1
-            )
-            if is_gated:
-                # Reorder rows for gated activation layout expected by TRTLLM.
-                w13_i = reorder_rows_for_gated_act_gemm(w13_i.clone())
-                w13_sf_i = reorder_rows_for_gated_act_gemm(w13_sf_i.clone())
+        w13_u8 = w13_weight.view(torch.uint8).reshape(num_experts, w13_rows, -1)
+        w2_u8 = layer.w2_weight.data.view(torch.uint8).reshape(num_experts, w2_rows, -1)
 
-            w13_shuffled_i = shuffle_matrix_a(w13_i.view(torch.uint8), epilogue_tile_m)
-            w2_shuffled_i = shuffle_matrix_a(
-                layer.w2_weight.data[i].view(torch.uint8), epilogue_tile_m
-            )
-            w13_weight_shuffled.append(
-                w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE)
-            )
-            w2_weight_shuffled.append(
-                w2_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE)
-            )
-            w13_sf_shuffled_i = shuffle_matrix_sf_a(
-                w13_sf_i.view(torch.uint8).reshape(
-                    intermediate_size_factor * layer.intermediate_size_per_partition,
-                    -1,
-                ),
-                epilogue_tile_m,
-            )
-            w2_sf_shuffled_i = shuffle_matrix_sf_a(
-                layer.w2_weight_scale.data[i]
-                .view(torch.uint8)
-                .reshape(layer.hidden_size, -1),
-                epilogue_tile_m,
-            )
-            w13_scale_shuffled.append(
-                w13_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
-            )
-            w2_scale_shuffled.append(
-                w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
-            )
+        if is_gated:
+            # Apply gated row reordering before TRTLLM shuffle
+            # for both weight and scale.
+            row_idx_gate = get_gated_reorder_row_indices(w13_rows).to(w13_weight.device)
+            w13_u8 = torch.index_select(w13_u8, 1, row_idx_gate).contiguous()
 
-        replace_parameter(
-            layer, "w13_weight", torch.stack(w13_weight_shuffled).contiguous()
+        w13_weight_shuffled = torch.index_select(w13_u8, 1, row_idx_w13).contiguous()
+        w2_weight_shuffled = torch.index_select(w2_u8, 1, row_idx_w2).contiguous()
+
+        w13_sf_u8 = w13_scale.view(torch.uint8).reshape(num_experts, w13_rows, -1)
+        w2_sf_u8 = layer.w2_weight_scale.data.view(torch.uint8).reshape(
+            num_experts, w2_rows, -1
         )
-        replace_parameter(
-            layer, "w2_weight", torch.stack(w2_weight_shuffled).contiguous()
-        )
-        replace_parameter(
-            layer,
-            "w13_weight_scale",
-            torch.stack(w13_scale_shuffled).contiguous(),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight_scale",
-            torch.stack(w2_scale_shuffled).contiguous(),
-        )
+        if is_gated:
+            row_idx_gate = get_gated_reorder_row_indices(w13_rows).to(w13_weight.device)
+            w13_sf_u8 = torch.index_select(w13_sf_u8, 1, row_idx_gate).contiguous()
+
+        w13_sf_linear = torch.index_select(w13_sf_u8, 1, row_idx_w13).contiguous()
+        w2_sf_linear = torch.index_select(w2_sf_u8, 1, row_idx_w2).contiguous()
+        w13_scale_shuffled = block_scale_interleave(w13_sf_linear).view(num_experts, -1)
+        w2_scale_shuffled = block_scale_interleave(w2_sf_linear).view(num_experts, -1)
+
+        w13_weight_out = w13_weight_shuffled.view(MXFP8_VALUE_DTYPE)
+        w2_weight_out = w2_weight_shuffled.view(MXFP8_VALUE_DTYPE)
+        w13_scale_out = w13_scale_shuffled.view(MXFP8_SCALE_DTYPE)
+        w2_scale_out = w2_scale_shuffled.view(MXFP8_SCALE_DTYPE)
+
+        replace_parameter(layer, "w13_weight", w13_weight_out.contiguous())
+        replace_parameter(layer, "w2_weight", w2_weight_out.contiguous())
+        replace_parameter(layer, "w13_weight_scale", w13_scale_out.contiguous())
+        replace_parameter(layer, "w2_weight_scale", w2_scale_out.contiguous())
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

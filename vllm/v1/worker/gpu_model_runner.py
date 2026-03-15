@@ -207,6 +207,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -5075,6 +5076,7 @@ class GPUModelRunner(
             # If force_attention is True, we always capture attention.
             # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                attn_meta_t0 = time.time()
                 if profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
@@ -5103,6 +5105,14 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
+                if is_profile:
+                    logger.warning(
+                        "MXFP8 profile probe: attention metadata built "
+                        "(elapsed=%.3fs, num_tokens=%s, num_reqs=%s)",
+                        time.time() - attn_meta_t0,
+                        num_tokens_unpadded,
+                        num_reqs,
+                    )
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -5173,6 +5183,14 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                if is_profile:
+                    logger.warning(
+                        "MXFP8 profile probe: entering model forward "
+                        "(num_tokens_padded=%s, num_reqs=%s)",
+                        num_tokens_padded,
+                        num_reqs,
+                    )
+                model_fwd_t0 = time.time()
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -5180,6 +5198,11 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                if is_profile:
+                    logger.warning(
+                        "MXFP8 profile probe: model forward finished (elapsed=%.3fs)",
+                        time.time() - model_fwd_t0,
+                    )
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -5246,7 +5269,15 @@ class GPUModelRunner(
         # In such cases, we still have to trigger EPLB to make sure
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
+            if is_profile:
+                logger.warning("MXFP8 profile probe: entering eplb_step")
+            eplb_t0 = time.time()
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+            if is_profile:
+                logger.warning(
+                    "MXFP8 profile probe: eplb_step finished (elapsed=%.3fs)",
+                    time.time() - eplb_t0,
+                )
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
@@ -5420,8 +5451,11 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        profile_t0 = time.time()
+        logger.warning("MXFP8 profile probe: profile_run start")
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
+            mm_t0 = time.time()
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and mm_config.skip_mm_profiling:
                 logger.info(
@@ -5477,22 +5511,47 @@ class GPUModelRunner(
                         )
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
+            logger.warning(
+                "MXFP8 profile probe: multimodal profiling stage done (elapsed=%.3fs)",
+                time.time() - mm_t0,
+            )
 
         # Add `is_profile` here to pre-allocate communication buffers
+        dummy_t0 = time.time()
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        logger.warning(
+            "MXFP8 profile probe: _dummy_run done (elapsed=%.3fs)",
+            time.time() - dummy_t0,
+        )
         if get_pp_group().is_last_rank:
+            post_dummy_t0 = time.time()
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:
                 output = self._dummy_sampler_run(last_hidden_states)
+            logger.warning(
+                "MXFP8 profile probe: post-dummy stage done "
+                "(elapsed=%.3fs, is_pooling_model=%s)",
+                time.time() - post_dummy_t0,
+                self.is_pooling_model,
+            )
         else:
             output = None
+        sync_t0 = time.time()
         self._sync_device()
+        logger.warning(
+            "MXFP8 profile probe: _sync_device done (elapsed=%.3fs)",
+            time.time() - sync_t0,
+        )
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        logger.warning(
+            "MXFP8 profile probe: profile_run end (total=%.3fs)",
+            time.time() - profile_t0,
+        )
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
