@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import time
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -103,6 +105,16 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+
+def _log_mxfp8_startup_timing() -> bool:
+    return os.getenv("VLLM_MODELOPT_LOG_STARTUP_TIMING", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
@@ -1625,6 +1637,9 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
 
     def _process_weights_after_loading_scale_1d(self, layer: torch.nn.Module) -> None:
         """Swizzled - MXFP8 GEMM Flashinfer CUTLASS"""
+        timing_enabled = _log_mxfp8_startup_timing()
+        start_t = time.perf_counter() if timing_enabled else 0.0
+
         weight = layer.weight.data  # [N, K]
         N, K = weight.shape
 
@@ -1640,6 +1655,14 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(
             weight_scale_swizzled.contiguous(), requires_grad=False
         )
+
+        if timing_enabled:
+            elapsed_s = time.perf_counter() - start_t
+            logger.info(
+                "MXFP8 linear swizzle done for weight shape=%s in %.3fs",
+                tuple(weight.shape),
+                elapsed_s,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Validate weight tensor
@@ -1831,6 +1854,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             shuffle_matrix_sf_a,
         )
 
+        timing_enabled = _log_mxfp8_startup_timing()
+        start_t = time.perf_counter() if timing_enabled else 0.0
+
         epilogue_tile_m = 128
         num_experts = layer.w13_weight.shape[0]
         is_gated = self.moe.is_act_and_mul
@@ -1890,6 +1916,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
             )
 
+            if timing_enabled and (i + 1) % 8 == 0:
+                logger.info(
+                    "MXFP8 MoE shuffle progress: %d/%d experts",
+                    i + 1,
+                    num_experts,
+                )
+
         replace_parameter(
             layer, "w13_weight", torch.stack(w13_weight_shuffled).contiguous()
         )
@@ -1906,6 +1939,14 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             "w2_weight_scale",
             torch.stack(w2_scale_shuffled).contiguous(),
         )
+
+        if timing_enabled:
+            elapsed_s = time.perf_counter() - start_t
+            logger.info(
+                "MXFP8 MoE TRTLLM shuffle done for %d experts in %.3fs",
+                num_experts,
+                elapsed_s,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
