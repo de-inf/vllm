@@ -1017,14 +1017,19 @@ def zero_experts_compute_triton(
     return output
 
 
-# Adapted from: https://github.com/sgl-project/sglang/pull/2628
-def get_config_file_name(
-    E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
-) -> str:
+def get_device_name() -> str:
     device_name = current_platform.get_device_name().replace(" ", "_")
     # Set device_name to H200 if a device from the H200 family is detected
     if "H200" in device_name.split("_"):
         device_name = "NVIDIA_H200"
+    return device_name
+
+
+# Adapted from: https://github.com/sgl-project/sglang/pull/2628
+def get_config_file_name(
+    E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
+) -> str:
+    device_name = get_device_name()
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"

@@ -7,6 +7,7 @@ import json
 import os
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import product
 from typing import Any, TypedDict
@@ -91,6 +92,51 @@ class BenchmarkConfig(TypedDict):
     GROUP_SIZE_M: int
     num_warps: int
     num_stages: int
+
+
+@dataclass(frozen=True)
+class BlockRanges:
+    block_m_range: tuple[int, ...]
+    block_n_range: tuple[int, ...]
+    block_k_range: tuple[int, ...]
+    num_warps_range: tuple[int, ...]
+    group_m_range: tuple[int, ...]
+    num_stage_range: tuple[int, ...]
+
+
+DEFAULT_BLOCK_RANGES = BlockRanges(
+    block_m_range=(16, 32, 64, 128, 256),
+    block_n_range=(32, 64, 128, 256),
+    block_k_range=(64, 128, 256),
+    num_warps_range=(4, 8),
+    group_m_range=(1, 16, 32, 64),
+    num_stage_range=(2, 3, 4, 5),
+)
+
+GB200_BLOCK_RANGES = BlockRanges(
+    # Conservative GB200 profile based on existing tuned JSON patterns.
+    # Based on all the existing tuned JSON for GB200.
+    block_m_range=(16, 32, 64, 128),
+    block_n_range=(64, 128),
+    block_k_range=(128, 256),
+    num_warps_range=(4, 8),
+    group_m_range=(1, 16, 32, 64),
+    num_stage_range=(3, 4),
+)
+
+# GPU names must follow get_device_name()
+GPU_SPECIFIC_BLOCK_RANGES: list[tuple[str, BlockRanges]] = [
+    # (GPU name, block ranges)
+    ("NVIDIA_GB200", GB200_BLOCK_RANGES),
+]
+
+
+def maybe_get_gpu_specific_block_ranges(device_name: str) -> BlockRanges | None:
+    """Return a hardware-specific search profile if one is defined."""
+    for device_key, block_ranges in GPU_SPECIFIC_BLOCK_RANGES:
+        if device_key in device_name:
+            return block_ranges
+    return None
 
 
 def benchmark_config(
@@ -364,7 +410,11 @@ def get_rocm_tuning_space(use_fp16):
     return param_ranges
 
 
-def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int]]:
+def get_configs_compute_bound(
+    use_fp16: bool,
+    block_quant_shape: list[int],
+    use_gpu_specific_search_space: bool = False,
+) -> list[dict[str, int]]:
     configs: list[BenchmarkConfig] = []
 
     if current_platform.is_rocm():
@@ -373,20 +423,26 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         # Reduced search space for faster tuning.
         # TODO(woosuk): Increase the search space and use a performance model to
         # prune the search space.
-        block_m_range = [16, 32, 64, 128, 256]
-        block_n_range = [32, 64, 128, 256]
-        block_k_range = [64, 128, 256]
-        num_warps_range = [4, 8]
-        group_m_range = [1, 16, 32, 64]
-        num_stage_range = [2, 3, 4, 5]
+        block_ranges = DEFAULT_BLOCK_RANGES
+
+        if use_gpu_specific_search_space:
+            # Use hardware-specific ranges if available
+            device_name = get_device_name()
+            block_ranges = maybe_get_gpu_specific_block_ranges(device_name)
+
+            if block_ranges is not None:
+                print("Using hardware-specific search space for", device_name)
+            else:
+                print("No hardware-specific search space available for", device_name)
+                block_ranges = DEFAULT_BLOCK_RANGES
 
         param_ranges = {
-            "BLOCK_SIZE_M": block_m_range,
-            "BLOCK_SIZE_N": block_n_range,
-            "BLOCK_SIZE_K": block_k_range,
-            "GROUP_SIZE_M": group_m_range,
-            "num_warps": num_warps_range,
-            "num_stages": num_stage_range,
+            "BLOCK_SIZE_M": list(block_ranges.block_m_range),
+            "BLOCK_SIZE_N": list(block_ranges.block_n_range),
+            "BLOCK_SIZE_K": list(block_ranges.block_k_range),
+            "GROUP_SIZE_M": list(block_ranges.group_m_range),
+            "num_warps": list(block_ranges.num_warps_range),
+            "num_stages": list(block_ranges.num_stage_range),
         }
 
     keys, values = zip(*param_ranges.items())
@@ -963,7 +1019,11 @@ def main(args: argparse.Namespace):
         # of group_size. Skip block_quant_shape filtering to keep the full
         # search space (e.g. BLOCK_SIZE_K=64 with group_size=128).
         tune_block_quant_shape = None if use_int4_w4a16 else block_quant_shape
-        search_space = get_configs_compute_bound(is_fp16, tune_block_quant_shape)
+        search_space = get_configs_compute_bound(
+            is_fp16,
+            tune_block_quant_shape,
+            use_gpu_specific_search_space=args.gpu_specific_search_space,
+        )
         if use_int4_w4a16:
             # SPLIT_K is a required kernel constexpr for gptq_awq kernel;
             # only SPLIT_K=1 is used at runtime, so fix it during tuning.
@@ -1062,6 +1122,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, nargs="+", required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--gpu-specific-search-space",
+        action="store_true",
+        help="Enable hardware-specific tuning ranges (if available)",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
     args = parser.parse_args()
