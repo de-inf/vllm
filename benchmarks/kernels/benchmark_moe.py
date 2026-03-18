@@ -1018,9 +1018,25 @@ if __name__ == "__main__":
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
     parser.add_argument(
-        "--tp-size", "-tp", "--tensor-parallel-size", type=int, default=2
+        "--tp-size",
+        "-tp",
+        "--tensor-parallel-size",
+        type=int,
+        default=2,
+        help=(
+            "Virtual tensor-parallel size used only to derive per-rank MoE "
+            "shapes for tuning/benchmarking."
+        ),
     )
-    parser.add_argument("--enable-expert-parallel", "-enable-ep", action="store_true")
+    parser.add_argument(
+        "--enable-expert-parallel",
+        "-enable-ep",
+        action="store_true",
+        help=(
+            "Use expert-parallel shape math when deriving benchmark dimensions "
+            "(shards experts instead of intermediate size)."
+        ),
+    )
     parser.add_argument(
         "--dtype",
         type=str,
@@ -1033,7 +1049,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, nargs="+", required=False)
-    parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help=(
+            "Run Triton kernel autotuning and save a tuned JSON config map "
+            "(batch size -> best kernel config). Without this flag, the script "
+            "only benchmarks using existing/default configs."
+        ),
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
     args = parser.parse_args()
