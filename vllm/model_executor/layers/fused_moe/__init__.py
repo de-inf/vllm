@@ -95,6 +95,7 @@ if HAS_TRITON:
         TritonWNA16Experts,
         fused_experts,
         get_config_file_name,
+        get_device_name,
     )
     from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
         AiterExperts,
@@ -118,6 +119,7 @@ if HAS_TRITON:
         "fused_topk",
         "fused_experts",
         "get_config_file_name",
+        "get_device_name",
         "GroupedTopk",
         "cutlass_moe_w4a8_fp8",
         "CutlassExpertsFp8",
