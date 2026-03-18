@@ -373,9 +373,9 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         # Reduced search space for faster tuning.
         # TODO(woosuk): Increase the search space and use a performance model to
         # prune the search space.
-        block_m_range = [16, 32, 64, 128, 256]
-        block_n_range = [32, 64, 128, 256]
-        block_k_range = [64, 128, 256]
+        block_m_range = [16, 32, 64, 128]
+        block_n_range = [32, 64, 128]
+        block_k_range = [64, 128]
         num_warps_range = [4, 8]
         group_m_range = [1, 16, 32, 64]
         num_stage_range = [2, 3, 4, 5]
