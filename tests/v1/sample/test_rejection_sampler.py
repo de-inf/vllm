@@ -305,6 +305,91 @@ def test_parametrized_cases(rejection_sampler, spec_tokens, output_tokens, expec
     assert torch.equal(output.sampled_token_ids, expected_tensor)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known bug: ragged spec-decode batches can produce invalid tail indices "
+        "that are clamped to unrelated rows when gathering accepted logprobs."
+    ),
+)
+def test_logprob_indexing_ragged_batch_regression(rejection_sampler):
+    """Reproduce ragged-batch indexing bug without loading any model.
+
+    Shape pattern mirrors real failures:
+    - sampled_token_ids has dense width [batch, max_spec_len + 1]
+    - only one request has non-zero num_draft_tokens
+    """
+    batch_size = 16
+    max_spec_len = 2
+    vocab_size = 8
+
+    # `spec_tokens` are the speculative draft tokens proposed per request.
+    # Here request 0 proposes two draft tokens [11, 12], while all other
+    # requests propose zero draft tokens.
+    spec_tokens = [[11, 12]] + [[] for _ in range(batch_size - 1)]
+    metadata = SpecDecodeMetadata.make_dummy(spec_tokens, device=DEVICE)
+
+    num_target_rows = 2
+    num_bonus_rows = batch_size
+    total_rows = num_target_rows + num_bonus_rows
+    metadata.target_logits_indices = torch.arange(
+        num_target_rows, dtype=torch.int32, device=DEVICE
+    )
+    metadata.bonus_logits_indices = torch.arange(
+        num_target_rows, total_rows, dtype=torch.int32, device=DEVICE
+    )
+
+    logits = torch.zeros((total_rows, vocab_size), dtype=torch.float32, device=DEVICE)
+    target_logits = (
+        torch.arange(num_target_rows, dtype=torch.float32, device=DEVICE)
+        .unsqueeze(1)
+        .repeat(1, vocab_size)
+    )
+    bonus_logits = (
+        torch.arange(num_target_rows, total_rows, dtype=torch.float32, device=DEVICE)
+        .unsqueeze(1)
+        .repeat(1, vocab_size)
+    )
+
+    # `sampled_token_ids` is dense [batch, max_spec_len + 1]:
+    # - col 0 is the first accepted/recovered/bonus output token
+    # - cols 1..max_spec_len are "tail" slots that are invalid when
+    #   num_draft_tokens == 0 for that request.
+    sampled_token_ids = torch.ones(
+        (batch_size, max_spec_len + 1), dtype=torch.int32, device=DEVICE
+    )
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture_compute_logprobs(x: torch.Tensor) -> torch.Tensor:
+        captured["accepted_logits"] = x.detach().clone()
+        return x
+
+    rejection_sampler.sampler.compute_logprobs = Mock(
+        side_effect=_capture_compute_logprobs
+    )
+    rejection_sampler.sampler.gather_logprobs = Mock(return_value=Mock())
+
+    _ = rejection_sampler._get_logprobs_tensors(
+        max_num_logprobs=0,
+        metadata=metadata,
+        logits=logits,
+        target_logits=target_logits,
+        bonus_logits=bonus_logits,
+        sampled_token_ids=sampled_token_ids,
+    )
+
+    accepted_logits = captured["accepted_logits"]
+
+    # For requests with zero draft tokens, only col 0 should be used for
+    # logprob indexing. Tail cols (1 and 2) must never map to real token rows;
+    # they should be masked to a safe filler row (0).
+    invalid_flat_indices = []
+    for req_idx in range(1, batch_size):
+        invalid_flat_indices.extend([req_idx * 3 + 1, req_idx * 3 + 2])
+    assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
+
+
 ########################### Tests for Random Sampling ###################
 @pytest.mark.parametrize("k", [1, 3, 5])
 @pytest.mark.parametrize("vocab_size", [1000])
