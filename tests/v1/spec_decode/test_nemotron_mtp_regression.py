@@ -9,6 +9,9 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 
+NEMOTRON_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+NEMOTRON_FP8_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
+
 PROMPTS = [
     "Solve briefly: 2x + 3 = 11.",
     "Write one sentence about matrix multiplication.",
@@ -72,7 +75,8 @@ def _run_mtp_vs_score(
     common_kwargs = dict(
         model=model,
         tensor_parallel_size=tp,
-        dtype="bfloat16",
+        # Allow BF16 and FP8 checkpoints to choose their intended runtime dtype.
+        dtype="auto",
         trust_remote_code=True,
         max_num_seqs=max_num_seqs,
         max_model_len=256,
@@ -145,6 +149,11 @@ _RAY_XFAIL_REASON = (
 )
 
 
+def _select_model_for_tp(tp: int) -> str:
+    # TP1 uses the FP8 checkpoint to avoid OOM with the BF16 checkpoint.
+    return NEMOTRON_FP8_MODEL if tp == 1 else NEMOTRON_BF16_MODEL
+
+
 @pytest.mark.parametrize(
     "use_ray,tp,max_num_seqs",
     [
@@ -195,7 +204,7 @@ def test_nemotron_mtp_logprob_regression_matrix(
     use_ray: bool, tp: int, max_num_seqs: int
 ):
     """Optional Nemotron MTP regression matrix for backend and TP size."""
-    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+    model = _select_model_for_tp(tp)
 
     # Skip matrix entries that cannot run on the current machine.
     available_gpus = torch.cuda.device_count()
