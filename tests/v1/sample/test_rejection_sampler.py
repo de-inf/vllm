@@ -390,6 +390,130 @@ def test_logprob_indexing_ragged_batch_regression(rejection_sampler):
     assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
 
 
+def _capture_ragged_accepted_logits(
+    rejection_sampler: RejectionSampler,
+    spec_tokens: list[list[int]],
+    vocab_size: int = 8,
+) -> tuple[torch.Tensor, SpecDecodeMetadata, int]:
+    """Build a ragged spec-decode shape and capture accepted logits rows."""
+    batch_size = len(spec_tokens)
+    max_spec_len = max(len(tokens) for tokens in spec_tokens)
+    metadata = SpecDecodeMetadata.make_dummy(spec_tokens, device=DEVICE)
+
+    num_target_rows = sum(len(tokens) for tokens in spec_tokens)
+    num_bonus_rows = batch_size
+    total_rows = num_target_rows + num_bonus_rows
+    metadata.target_logits_indices = torch.arange(
+        num_target_rows, dtype=torch.int32, device=DEVICE
+    )
+    metadata.bonus_logits_indices = torch.arange(
+        num_target_rows, total_rows, dtype=torch.int32, device=DEVICE
+    )
+
+    logits = torch.zeros((total_rows, vocab_size), dtype=torch.float32, device=DEVICE)
+    target_logits = (
+        torch.arange(num_target_rows, dtype=torch.float32, device=DEVICE)
+        .unsqueeze(1)
+        .repeat(1, vocab_size)
+    )
+    bonus_logits = (
+        torch.arange(num_target_rows, total_rows, dtype=torch.float32, device=DEVICE)
+        .unsqueeze(1)
+        .repeat(1, vocab_size)
+    )
+    sampled_token_ids = torch.ones(
+        (batch_size, max_spec_len + 1), dtype=torch.int32, device=DEVICE
+    )
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture_compute_logprobs(x: torch.Tensor) -> torch.Tensor:
+        captured["accepted_logits"] = x.detach().clone()
+        return x
+
+    rejection_sampler.sampler.compute_logprobs = Mock(
+        side_effect=_capture_compute_logprobs
+    )
+    rejection_sampler.sampler.gather_logprobs = Mock(return_value=Mock())
+    _ = rejection_sampler._get_logprobs_tensors(
+        max_num_logprobs=0,
+        metadata=metadata,
+        logits=logits,
+        target_logits=target_logits,
+        bonus_logits=bonus_logits,
+        sampled_token_ids=sampled_token_ids,
+    )
+    return captured["accepted_logits"], metadata, max_spec_len
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known bug: ragged spec-decode batches can produce invalid tail indices "
+        "that are clamped to unrelated rows when gathering accepted logprobs."
+    ),
+)
+def test_logprob_indexing_ragged_nonfirst_active_row_regression(rejection_sampler):
+    """Same bug shape, but with active speculative row not at index 0."""
+    spec_tokens = [[], [], [31, 32], [], []]
+    accepted_logits, _, max_spec_len = _capture_ragged_accepted_logits(
+        rejection_sampler, spec_tokens
+    )
+    stride = max_spec_len + 1
+
+    invalid_flat_indices: list[int] = []
+    for req_idx, draft_tokens in enumerate(spec_tokens):
+        first_invalid_col = len(draft_tokens) + 1
+        for col in range(first_invalid_col, stride):
+            invalid_flat_indices.append(req_idx * stride + col)
+
+    assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known bug: ragged spec-decode batches can produce invalid tail indices "
+        "that are clamped to unrelated rows when gathering accepted logprobs."
+    ),
+)
+def test_logprob_indexing_ragged_mixed_lengths_regression(rejection_sampler):
+    """Mixed 0/1/2 draft-token rows should also mask invalid tail positions."""
+    spec_tokens = [[10], [], [20, 21], [], [30]]
+    accepted_logits, _, max_spec_len = _capture_ragged_accepted_logits(
+        rejection_sampler, spec_tokens
+    )
+    stride = max_spec_len + 1
+
+    invalid_flat_indices: list[int] = []
+    for req_idx, draft_tokens in enumerate(spec_tokens):
+        first_invalid_col = len(draft_tokens) + 1
+        for col in range(first_invalid_col, stride):
+            invalid_flat_indices.append(req_idx * stride + col)
+
+    assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
+
+
+def test_logprob_indexing_ragged_valid_positions_follow_offsets(rejection_sampler):
+    """Guardrail: valid positions should always map to their cu-offset rows."""
+    spec_tokens = [[11, 12], [], [22], [], [33, 34]]
+    accepted_logits, metadata, max_spec_len = _capture_ragged_accepted_logits(
+        rejection_sampler, spec_tokens
+    )
+    stride = max_spec_len + 1
+
+    cu_num_sampled_tokens = torch.zeros_like(metadata.cu_num_sampled_tokens)
+    cu_num_sampled_tokens[1:] = metadata.cu_num_sampled_tokens[:-1]
+    starts = cu_num_sampled_tokens.tolist()
+
+    for req_idx, draft_tokens in enumerate(spec_tokens):
+        valid_cols = len(draft_tokens) + 1
+        for col in range(valid_cols):
+            flat_idx = req_idx * stride + col
+            expected_row = starts[req_idx] + col
+            assert accepted_logits[flat_idx, 0].item() == float(expected_row)
+
+
 ########################### Tests for Random Sampling ###################
 @pytest.mark.parametrize("k", [1, 3, 5])
 @pytest.mark.parametrize("vocab_size", [1000])
