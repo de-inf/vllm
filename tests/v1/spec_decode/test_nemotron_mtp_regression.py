@@ -79,7 +79,6 @@ def _run_mtp_vs_score(
         dtype="auto",
         trust_remote_code=True,
         max_num_seqs=max_num_seqs,
-        max_model_len=256,
         gpu_memory_utilization=0.7,
         logprobs_mode="processed_logprobs",
         enable_chunked_prefill=False,
@@ -91,6 +90,7 @@ def _run_mtp_vs_score(
 
     llm_gen = LLM(
         **common_kwargs,
+        max_model_len=8192,
         # MTP speculation width: each step can propose up to 2 draft tokens
         # before target-model verification.
         speculative_config={"method": "mtp", "num_speculative_tokens": 2},
