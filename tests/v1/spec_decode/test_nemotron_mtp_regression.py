@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+python3 -m pytest tests/v1/spec_decode/test_nemotron_mtp_regression.py -k tp2
+"""
 
 import math
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -69,9 +73,95 @@ def _compute_tme(lps_a, lps_b):
     return total / max(count, 1)
 
 
+@dataclass
+class _SeqDiag:
+    seq_idx: int
+    num_gen_tokens: int
+    tme: float
+    mean_abs_lp_diff: float
+    max_abs_lp_diff: float
+    max_abs_lp_diff_pos: int
+    last_abs_lp_diff: float
+    has_last_token_cliff: bool
+
+
+def _compute_seq_diag(
+    seq_idx: int, gen_lps: list[float], score_lps: list[float]
+) -> _SeqDiag:
+    valid_abs_diffs: list[float] = []
+    valid_positions: list[int] = []
+    for j, (a, b) in enumerate(zip(gen_lps, score_lps)):
+        if math.isnan(a) or math.isnan(b):
+            continue
+        valid_abs_diffs.append(abs(a - b))
+        valid_positions.append(j)
+
+    if not valid_abs_diffs:
+        return _SeqDiag(
+            seq_idx=seq_idx,
+            num_gen_tokens=len(gen_lps),
+            tme=1.0,
+            mean_abs_lp_diff=0.0,
+            max_abs_lp_diff=0.0,
+            max_abs_lp_diff_pos=-1,
+            last_abs_lp_diff=0.0,
+            has_last_token_cliff=False,
+        )
+
+    max_idx = max(range(len(valid_abs_diffs)), key=lambda i: valid_abs_diffs[i])
+    max_pos = valid_positions[max_idx]
+    max_abs = valid_abs_diffs[max_idx]
+    mean_abs = sum(valid_abs_diffs) / len(valid_abs_diffs)
+    last_abs = valid_abs_diffs[-1]
+
+    # Heuristic: a "last-token cliff" is when the largest divergence is at the
+    # final valid generated token and clearly above baseline jitter.
+    has_last_token_cliff = (max_pos == valid_positions[-1]) and (max_abs > 1.0)
+
+    return _SeqDiag(
+        seq_idx=seq_idx,
+        num_gen_tokens=len(gen_lps),
+        tme=math.exp(mean_abs),
+        mean_abs_lp_diff=mean_abs,
+        max_abs_lp_diff=max_abs,
+        max_abs_lp_diff_pos=max_pos,
+        last_abs_lp_diff=last_abs,
+        has_last_token_cliff=has_last_token_cliff,
+    )
+
+
+def _format_diag_summary(diags: list[_SeqDiag], top_k: int = 4) -> str:
+    if not diags:
+        return "no sequence diagnostics available"
+
+    sorted_diags = sorted(diags, key=lambda d: d.max_abs_lp_diff, reverse=True)
+    top = sorted_diags[:top_k]
+    last_cliff_count = sum(1 for d in diags if d.has_last_token_cliff)
+    avg_max_abs = sum(d.max_abs_lp_diff for d in diags) / len(diags)
+
+    lines = [
+        (
+            "diag_overview: "
+            f"seqs={len(diags)} "
+            f"last_token_cliffs={last_cliff_count} "
+            f"avg_max_abs_lp_diff={avg_max_abs:.3f}"
+        )
+    ]
+    for d in top:
+        lines.append(
+            "top_seq: "
+            f"idx={d.seq_idx} tokens={d.num_gen_tokens} "
+            f"tme={d.tme:.3f} mean_abs={d.mean_abs_lp_diff:.3f} "
+            f"max_abs={d.max_abs_lp_diff:.3f}@{d.max_abs_lp_diff_pos} "
+            f"last_abs={d.last_abs_lp_diff:.3f} "
+            f"last_cliff={d.has_last_token_cliff}"
+        )
+    return " | ".join(lines)
+
+
 def _run_mtp_vs_score(
     *, model: str, tp: int, use_ray: bool, max_num_seqs: int
-) -> tuple[float, int]:
+) -> tuple[float, int, str]:
     common_kwargs = dict(
         model=model,
         tensor_parallel_size=tp,
@@ -133,14 +223,16 @@ def _run_mtp_vs_score(
     del llm_score
 
     seq_tmes = []
-    for seq, sout in zip(sequences, score_outputs):
+    seq_diags: list[_SeqDiag] = []
+    for i, (seq, sout) in enumerate(zip(sequences, score_outputs)):
         plen = len(seq["prompt_ids"])
         score_lps = _extract_score_logprobs(sout, plen, seq["gen_ids"])
         seq_tmes.append(_compute_tme(seq["gen_lps"], score_lps))
+        seq_diags.append(_compute_seq_diag(i, seq["gen_lps"], score_lps))
 
     avg_tme = sum(seq_tmes) / len(seq_tmes)
     outliers = sum(1 for t in seq_tmes if t > 2.0)
-    return avg_tme, outliers
+    return avg_tme, outliers, _format_diag_summary(seq_diags)
 
 
 _RAY_XFAIL_REASON = (
@@ -214,7 +306,7 @@ def test_nemotron_mtp_logprob_regression_matrix(
         )
 
     try:
-        avg_tme, outliers = _run_mtp_vs_score(
+        avg_tme, outliers, diag_summary = _run_mtp_vs_score(
             model=model,
             tp=tp,
             use_ray=use_ray,
@@ -230,9 +322,9 @@ def test_nemotron_mtp_logprob_regression_matrix(
     backend = "ray" if use_ray else "mp"
     assert avg_tme < 1.2, (
         f"Expected stable {backend} path at max_num_seqs={max_num_seqs}, "
-        f"got avg_tme={avg_tme:.3f}"
+        f"got avg_tme={avg_tme:.3f}. {diag_summary}"
     )
     assert outliers == 0, (
         f"Expected no {backend} outliers at max_num_seqs={max_num_seqs}, "
-        f"got outliers={outliers}"
+        f"got outliers={outliers}. {diag_summary}"
     )
