@@ -184,22 +184,57 @@ class RejectionSampler(nn.Module):
         final_logits[target_logits_indices] = target_logits.to(torch.float32)
         final_logits[bonus_logits_indices] = bonus_logits.to(torch.float32)
 
-        # NOTE: To avoid cpu-gpu synchronization, we now simply compute indices for
-        # all draft tokens, including the rejected ones. The rejected tokens will
-        # be filtered out in the `parse_output`.
+        # Static-shape path: avoid dynamic-shape indexing while preventing
+        # invalid tails from aliasing to a real logits row.
         logit_start_indices = cu_num_sampled_tokens
         offsets = torch.arange(
             sampled_token_ids.shape[-1],
             device=logit_start_indices.device,
             dtype=logit_start_indices.dtype,
         )
-        accepted_logit_indices = (
-            logit_start_indices.unsqueeze(1) + offsets.unsqueeze(0)
-        ).flatten()
-        accepted_logit_indices.clamp_(max=final_logits.shape[0] - 1)
-        accepted_tokens = sampled_token_ids.clone().flatten()
-        # we replace rejected token ids with 0 to avoid gather_logprobs error
-        accepted_tokens[accepted_tokens == PLACEHOLDER_TOKEN_ID] = 0
+        all_logit_indices = logit_start_indices.unsqueeze(1) + offsets.unsqueeze(0)
+        all_tokens = sampled_token_ids.clone()
+
+        num_rows, vocab_size = final_logits.shape
+        # Slot validity is based on metadata contract: each request has
+        # (num_draft_tokens + 1) valid sampled positions.
+        num_sampled_tokens = (
+            torch.tensor(
+                metadata.num_draft_tokens,
+                device=all_logit_indices.device,
+                dtype=all_logit_indices.dtype,
+            )
+            + 1
+        )
+        valid_slots = offsets.unsqueeze(0) < num_sampled_tokens.unsqueeze(1)
+        valid_tokens = (all_tokens != PLACEHOLDER_TOKEN_ID) & (all_tokens < vocab_size)
+        valid_indices = all_logit_indices < num_rows
+        valid_entries = valid_slots & valid_tokens & valid_indices
+
+        # Append one dummy row so invalid positions never alias real rows.
+        dummy_logits = torch.full(
+            (1, vocab_size),
+            -1.0,
+            dtype=final_logits.dtype,
+            device=final_logits.device,
+        )
+        final_logits = torch.cat([final_logits, dummy_logits], dim=0)
+        dummy_idx = num_rows
+
+        accepted_logit_indices = all_logit_indices.flatten()
+        accepted_logit_indices = torch.where(
+            valid_entries.flatten(),
+            accepted_logit_indices,
+            torch.full_like(accepted_logit_indices, dummy_idx),
+        )
+        accepted_tokens = all_tokens.flatten()
+        # Gather path requires valid token ids; invalid entries are filtered
+        # in parse_output, so assign a safe in-range id here.
+        accepted_tokens = torch.where(
+            valid_entries.flatten(),
+            accepted_tokens,
+            torch.zeros_like(accepted_tokens),
+        )
 
         # Compute logprobs for accepted tokens.
         accepted_logits = final_logits[accepted_logit_indices]
