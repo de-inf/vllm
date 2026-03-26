@@ -1305,3 +1305,78 @@ def test_calc_spec_decode_metadata_many_zero_draft_rows() -> None:
         start + d for start, d in zip(starts_in_sampled, num_draft_tokens)
     ]
     assert metadata.bonus_logits_indices.cpu().tolist() == expected_bonus
+
+
+def test_calc_spec_decode_metadata_request_order_permutation_invariance() -> None:
+    # Same logical requests in different in-batch orders should preserve
+    # per-request segment invariants after remapping by permutation.
+    drafts_a = [2, 0, 1, 0]
+    gaps_a = [0, 4, 0, 3]
+    perm = [2, 0, 3, 1]
+    drafts_b = [drafts_a[i] for i in perm]
+    gaps_b = [gaps_a[i] for i in perm]
+
+    def _calc_segments(num_draft_tokens: list[int], schedule_gaps: list[int]):
+        num_draft_tokens_np = np.array(num_draft_tokens, dtype=np.int32)
+        cu_num_scheduled_tokens = _build_cu_num_scheduled_tokens_for_spec_test(
+            num_draft_tokens_np, schedule_gaps
+        )
+        max_idx = int(cu_num_scheduled_tokens[-1])
+
+        fake_runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            arange_np=np.arange(max_idx + 1, dtype=np.int32),
+            input_ids=SimpleNamespace(gpu=torch.arange(max_idx + 1, dtype=torch.int32)),
+        )
+        fake_runner._get_cumsum_and_arange = (
+            GPUModelRunner._get_cumsum_and_arange.__get__(
+                fake_runner, type(fake_runner)
+            )
+        )
+        metadata = GPUModelRunner._calc_spec_decode_metadata(
+            fake_runner, num_draft_tokens_np, cu_num_scheduled_tokens
+        )
+
+        num_sampled_tokens = [d + 1 for d in num_draft_tokens]
+        starts_in_sampled = [0] + np.cumsum(num_sampled_tokens, dtype=np.int32)[
+            :-1
+        ].tolist()
+        starts_in_scheduler = (
+            cu_num_scheduled_tokens - np.array(num_sampled_tokens, dtype=np.int32)
+        ).tolist()
+
+        req_to_logits = {}
+        req_to_target = {}
+        req_to_bonus = {}
+        for req_idx, (start_sched, start_sampled, d) in enumerate(
+            zip(starts_in_scheduler, starts_in_sampled, num_draft_tokens)
+        ):
+            req_to_logits[req_idx] = list(range(start_sched, start_sched + d + 1))
+            req_to_target[req_idx] = list(range(start_sampled, start_sampled + d))
+            req_to_bonus[req_idx] = start_sampled + d
+
+        expected_logits = [
+            x for i in range(len(num_draft_tokens)) for x in req_to_logits[i]
+        ]
+        expected_target = [
+            x for i in range(len(num_draft_tokens)) for x in req_to_target[i]
+        ]
+        expected_bonus = [req_to_bonus[i] for i in range(len(num_draft_tokens))]
+        assert metadata.logits_indices.cpu().tolist() == expected_logits
+        assert metadata.target_logits_indices.cpu().tolist() == expected_target
+        assert metadata.bonus_logits_indices.cpu().tolist() == expected_bonus
+        return req_to_logits, req_to_target, req_to_bonus
+
+    seg_a, tgt_a, bonus_a = _calc_segments(drafts_a, gaps_a)
+    seg_b, tgt_b, bonus_b = _calc_segments(drafts_b, gaps_b)
+
+    inv_perm = {new_idx: old_idx for new_idx, old_idx in enumerate(perm)}
+    for req_b, req_a in inv_perm.items():
+        assert len(seg_b[req_b]) == len(seg_a[req_a]) == drafts_a[req_a] + 1
+        assert len(tgt_b[req_b]) == len(tgt_a[req_a]) == drafts_a[req_a]
+        assert bonus_a[req_a] == (
+            tgt_a[req_a][-1] + 1 if tgt_a[req_a] else bonus_a[req_a]
+        )
+        assert bonus_b[req_b] == (
+            tgt_b[req_b][-1] + 1 if tgt_b[req_b] else bonus_b[req_b]
+        )
