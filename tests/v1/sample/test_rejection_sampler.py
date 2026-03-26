@@ -305,13 +305,6 @@ def test_parametrized_cases(rejection_sampler, spec_tokens, output_tokens, expec
     assert torch.equal(output.sampled_token_ids, expected_tensor)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known bug: ragged spec-decode batches can produce invalid tail indices "
-        "that are clamped to unrelated rows when gathering accepted logprobs."
-    ),
-)
 def test_logprob_indexing_ragged_batch_regression(rejection_sampler):
     """Reproduce ragged-batch indexing bug without loading any model.
 
@@ -383,11 +376,11 @@ def test_logprob_indexing_ragged_batch_regression(rejection_sampler):
 
     # For requests with zero draft tokens, only col 0 should be used for
     # logprob indexing. Tail cols (1 and 2) must never map to real token rows;
-    # they should be masked to a safe filler row (0).
+    # they should be routed to a dummy row (-1.0 logits).
     invalid_flat_indices = []
     for req_idx in range(1, batch_size):
         invalid_flat_indices.extend([req_idx * 3 + 1, req_idx * 3 + 2])
-    assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
+    assert torch.all(accepted_logits[invalid_flat_indices, 0] == -1)
 
 
 def _capture_ragged_accepted_logits(
@@ -446,13 +439,6 @@ def _capture_ragged_accepted_logits(
     return captured["accepted_logits"], metadata, max_spec_len
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known bug: ragged spec-decode batches can produce invalid tail indices "
-        "that are clamped to unrelated rows when gathering accepted logprobs."
-    ),
-)
 def test_logprob_indexing_ragged_nonfirst_active_row_regression(rejection_sampler):
     """Same bug shape, but with active speculative row not at index 0."""
     spec_tokens = [[], [], [31, 32], [], []]
@@ -467,16 +453,9 @@ def test_logprob_indexing_ragged_nonfirst_active_row_regression(rejection_sample
         for col in range(first_invalid_col, stride):
             invalid_flat_indices.append(req_idx * stride + col)
 
-    assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
+    assert torch.all(accepted_logits[invalid_flat_indices, 0] == -1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known bug: ragged spec-decode batches can produce invalid tail indices "
-        "that are clamped to unrelated rows when gathering accepted logprobs."
-    ),
-)
 def test_logprob_indexing_ragged_mixed_lengths_regression(rejection_sampler):
     """Mixed 0/1/2 draft-token rows should also mask invalid tail positions."""
     spec_tokens = [[10], [], [20, 21], [], [30]]
@@ -491,7 +470,7 @@ def test_logprob_indexing_ragged_mixed_lengths_regression(rejection_sampler):
         for col in range(first_invalid_col, stride):
             invalid_flat_indices.append(req_idx * stride + col)
 
-    assert torch.all(accepted_logits[invalid_flat_indices, 0] == 0)
+    assert torch.all(accepted_logits[invalid_flat_indices, 0] == -1)
 
 
 def test_logprob_indexing_ragged_valid_positions_follow_offsets(rejection_sampler):
