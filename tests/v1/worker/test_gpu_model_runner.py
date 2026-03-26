@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -1199,3 +1201,107 @@ def test_is_uniform_decode() -> None:
         num_reqs=15,
         force_uniform_decode=False,
     )
+
+
+def _build_cu_num_scheduled_tokens_for_spec_test(
+    num_draft_tokens: np.ndarray, schedule_gaps: list[int]
+) -> np.ndarray:
+    assert len(num_draft_tokens) == len(schedule_gaps)
+    out: list[int] = []
+    end = 0
+    for d, gap in zip(num_draft_tokens.tolist(), schedule_gaps):
+        end += gap + (d + 1)
+        out.append(end)
+    return np.array(out, dtype=np.int32)
+
+
+@pytest.mark.parametrize(
+    "num_draft_tokens,schedule_gaps",
+    [
+        pytest.param([3, 0, 2, 0, 1], [0, 99, 0, 99, 0], id="golden-gapped"),
+        pytest.param([2, 0, 1], [0, 0, 0], id="ragged-contiguous"),
+        pytest.param([1, 0, 2, 0], [0, 1, 0, 4], id="ragged-gapped"),
+    ],
+)
+def test_calc_spec_decode_metadata_layout_indices(
+    num_draft_tokens: list[int], schedule_gaps: list[int]
+) -> None:
+    num_draft_tokens_np = np.array(num_draft_tokens, dtype=np.int32)
+    cu_num_scheduled_tokens = _build_cu_num_scheduled_tokens_for_spec_test(
+        num_draft_tokens_np, schedule_gaps
+    )
+    max_idx = int(cu_num_scheduled_tokens[-1])
+
+    fake_runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        arange_np=np.arange(max_idx + 1, dtype=np.int32),
+        input_ids=SimpleNamespace(gpu=torch.arange(max_idx + 1, dtype=torch.int32)),
+    )
+    fake_runner._get_cumsum_and_arange = GPUModelRunner._get_cumsum_and_arange.__get__(
+        fake_runner, type(fake_runner)
+    )
+    metadata = GPUModelRunner._calc_spec_decode_metadata(
+        fake_runner, num_draft_tokens_np, cu_num_scheduled_tokens
+    )
+
+    num_sampled_tokens = (num_draft_tokens_np + 1).tolist()
+    cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)
+    starts_in_sampled = [0] + cu_num_sampled_tokens[:-1].tolist()
+    starts_in_scheduler = (cu_num_scheduled_tokens - (num_draft_tokens_np + 1)).tolist()
+
+    expected_logits_indices: list[int] = []
+    expected_target_indices: list[int] = []
+    expected_bonus_indices: list[int] = []
+
+    for req_start_sched, req_start_sampled, d in zip(
+        starts_in_scheduler, starts_in_sampled, num_draft_tokens
+    ):
+        sampled = d + 1
+        expected_logits_indices.extend(
+            range(req_start_sched, req_start_sched + sampled)
+        )
+        expected_target_indices.extend(range(req_start_sampled, req_start_sampled + d))
+        expected_bonus_indices.append(req_start_sampled + d)
+
+    assert metadata.logits_indices.cpu().tolist() == expected_logits_indices
+    assert metadata.target_logits_indices.cpu().tolist() == expected_target_indices
+    assert metadata.bonus_logits_indices.cpu().tolist() == expected_bonus_indices
+
+
+def test_calc_spec_decode_metadata_many_zero_draft_rows() -> None:
+    # Pattern close to observed runtime failures:
+    # many requests with 0 draft tokens, and one request with 2 draft tokens.
+    batch_size = 12
+    active_req = 2
+    num_draft_tokens = [0] * batch_size
+    num_draft_tokens[active_req] = 2
+    num_draft_tokens_np = np.array(num_draft_tokens, dtype=np.int32)
+    cu_num_scheduled_tokens = _build_cu_num_scheduled_tokens_for_spec_test(
+        num_draft_tokens_np, [0] * batch_size
+    )
+    max_idx = int(cu_num_scheduled_tokens[-1])
+
+    fake_runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        arange_np=np.arange(max_idx + 1, dtype=np.int32),
+        input_ids=SimpleNamespace(gpu=torch.arange(max_idx + 1, dtype=torch.int32)),
+    )
+    fake_runner._get_cumsum_and_arange = GPUModelRunner._get_cumsum_and_arange.__get__(
+        fake_runner, type(fake_runner)
+    )
+    metadata = GPUModelRunner._calc_spec_decode_metadata(
+        fake_runner, num_draft_tokens_np, cu_num_scheduled_tokens
+    )
+
+    # Each request contributes exactly (d + 1) sampled rows.
+    expected_total_rows = int(np.sum(num_draft_tokens_np + 1))
+    assert int(metadata.cu_num_sampled_tokens[-1].item()) == expected_total_rows
+
+    # Bonus row is always the last sampled row in each request segment.
+    starts_in_sampled = [0] + np.cumsum(num_draft_tokens_np + 1, dtype=np.int32)[
+        :-1
+    ].tolist()
+    expected_bonus = [
+        start + d for start, d in zip(starts_in_sampled, num_draft_tokens)
+    ]
+    assert metadata.bonus_logits_indices.cpu().tolist() == expected_bonus
