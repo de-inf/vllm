@@ -134,6 +134,7 @@ def test_with_spec_decoding(sample_json_schema, monkeypatch: pytest.MonkeyPatch)
         (False, "mp", False, None, False),
         (False, "mp", False, spec_config, False),
         (True, "mp", False, spec_config, True),
+        (False, "mp", False, spec_config_short, False),
         (True, "uni", False, spec_config_short, True),
         (False, "mp", True, spec_config, False),
         (True, "mp", True, spec_config, False),
