@@ -526,7 +526,9 @@ def test_update_states_async_invalid_sampled_count_index_fails_fast(
     monkeypatch.setattr(
         model_runner,
         "_get_valid_sampled_token_count_and_prev_draft_len",
-        lambda: ([5], [5], [req_id]),
+        # req_id resolves to index=1 in sampled_req_ids but only one count is
+        # available, so this should trigger invalid sampled-count index.
+        lambda: ([5], [5], ["other_req", req_id]),
     )
 
     cached_req_data = CachedRequestData(
@@ -561,7 +563,8 @@ def test_update_states_async_missing_prev_req_mapping_skips_adjustment(
     model_runner._update_states(_schedule_new_request(req_id))
 
     model_runner.use_async_scheduling = True
-    # Request is absent from previous-index map in this boundary step.
+    # Request is absent from prev_req_id_to_index, but async correction now
+    # uses sampled snapshot req_ids as the source of truth.
     model_runner.input_batch.prev_req_id_to_index = {}
     monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
     monkeypatch.setattr(
@@ -592,8 +595,8 @@ def test_update_states_async_missing_prev_req_mapping_skips_adjustment(
     )
 
     model_runner._update_states(scheduler_output)
-    # Adjustment is skipped when no prev mapping exists.
-    assert model_runner.requests[req_id].num_computed_tokens == 100
+    # Accepted=4 (count-1), rejected=1 from snapshot prev_draft_len=5.
+    assert model_runner.requests[req_id].num_computed_tokens == 99
 
 
 def test_kv_cache_stride_order(monkeypatch, model_runner):
