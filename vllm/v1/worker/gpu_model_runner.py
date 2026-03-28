@@ -1179,8 +1179,41 @@ class GPUModelRunner(
                     assert self.input_batch.prev_req_id_to_index is not None
                     prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
+                    if num_accepted < 0 or num_accepted > req_state.prev_num_draft_len:
+                        msg = (
+                            "Invalid async accepted-token bookkeeping: "
+                            f"req_id={req_id} req_idx={i} "
+                            f"prev_req_index={prev_req_index} "
+                            f"num_accepted={num_accepted} "
+                            f"prev_num_draft_len={req_state.prev_num_draft_len} "
+                            f"valid_sampled_token_count="
+                            f"{valid_sampled_token_count[prev_req_index]}"
+                        )
+                        if _mtp_fail_fast_enabled():
+                            raise AssertionError(msg)
+                        if _mtp_debug_enabled(i):
+                            logger.warning("[MTP-DBG async-anomaly] %s", msg)
                     num_rejected = req_state.prev_num_draft_len - num_accepted
+                    prev_num_computed_tokens = num_computed_tokens
                     num_computed_tokens -= num_rejected
+                    if (
+                        num_computed_tokens < 0
+                        or num_computed_tokens > self.max_model_len
+                    ):
+                        msg = (
+                            "Invalid async num_computed_tokens transition: "
+                            f"req_id={req_id} req_idx={i} "
+                            f"prev_num_computed={prev_num_computed_tokens} "
+                            f"num_rejected={num_rejected} "
+                            f"new_num_computed={num_computed_tokens} "
+                            f"max_model_len={self.max_model_len} "
+                            f"prev_num_draft_len={req_state.prev_num_draft_len} "
+                            f"num_accepted={num_accepted}"
+                        )
+                        if _mtp_fail_fast_enabled():
+                            raise AssertionError(msg)
+                        if _mtp_debug_enabled(i):
+                            logger.warning("[MTP-DBG async-anomaly] %s", msg)
                     req_state.output_token_ids.extend([-1] * num_accepted)
 
             # Update the cached states.
