@@ -517,6 +517,7 @@ def test_update_states_async_invalid_sampled_count_index_fails_fast(
 ):
     req_id = "req_0"
     model_runner._update_states(_schedule_new_request(req_id))
+    model_runner.requests[req_id].prev_num_draft_len = 5
 
     model_runner.use_async_scheduling = True
     model_runner.input_batch.prev_req_id_to_index = {req_id: 1}
