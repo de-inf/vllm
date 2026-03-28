@@ -3,12 +3,14 @@
 from typing import Any
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
@@ -903,3 +905,283 @@ def test_sample_recovered_tokens(
         device=DEVICE,
     )
     assert torch.equal(recovered_token_ids, ref_recovered_token_ids)
+
+
+########################### Tests for Ragged Batches #####################
+@pytest.mark.parametrize(
+    "spec_tokens,output_tokens",
+    [
+        ([[1, 2, 3], [4], [5, 6]], [[1, 2, 3, 10], [4, 11], [5, 6, 12]]),
+        ([[1, 2, 3], [], [5, 6]], [[1, 2, 3, 10], [11], [5, 6, 12]]),
+        ([[1], [2, 3], [4, 5, 6]], [[1, 10], [2, 3, 11], [4, 5, 6, 12]]),
+    ],
+    ids=["ragged-3-1-2", "ragged-3-0-2", "ragged-1-2-3"],
+)
+def test_ragged_all_accept(rejection_sampler, spec_tokens, output_tokens):
+    """Ragged draft lengths with all tokens accepted + bonus."""
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(output_tokens)
+    bonus = torch.tensor([t[-1] for t in output_tokens], device=logits.device)
+    sd_meta = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus)
+    output = rejection_sampler(
+        sd_meta, draft_probs=None, logits=logits, sampling_metadata=metadata
+    )
+    parsed, _ = RejectionSampler.parse_output(output.sampled_token_ids, vocab_size=100)
+    assert parsed == output_tokens
+
+
+def test_ragged_mixed_accept_reject(rejection_sampler):
+    """Ragged batch: req0 all-accept, req1 reject-at-0, req2 accept-2."""
+    spec_tokens = [[1, 2, 3], [4], [5, 6]]
+    output_tokens = [
+        # All spec tokens accepted + bonus appended
+        [1, 2, 3, 99],
+        # First spec token rejected immediately
+        # Bonus token 99 will not be used
+        [9, 99],
+        # First spec token 5 accepted, second spec token 6 rejected
+        # Recovery token 8 replaces rejected position, bonus not appended
+        [5, 8, 99],
+    ]
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(output_tokens)
+    bonus = torch.tensor([99, 99, 99], device=logits.device)
+    sd_meta = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus)
+    output = rejection_sampler(
+        sd_meta, draft_probs=None, logits=logits, sampling_metadata=metadata
+    )
+    parsed, _ = RejectionSampler.parse_output(output.sampled_token_ids, vocab_size=100)
+    # All spec tokens accepted + bonus appended
+    assert parsed[0] == [1, 2, 3, 99]
+    # Spec token 4 rejected, only recovery token 9 is used
+    assert parsed[1] == [9]
+    # First spec token 5 accepted, second spec token 6 rejected
+    # Recovery token 8 replaces rejected position, bonus not appended
+    assert parsed[2] == [5, 8]
+
+
+######################## Tests for Tail-Alias Bug Fix ####################
+def _build_logprobs_metadata(num_draft_tokens):
+    """Build SpecDecodeMetadata with correct flattened index layout."""
+    num_sampled = [d + 1 for d in num_draft_tokens]
+    cu_sampled = np.cumsum(num_sampled, dtype=np.int32)
+    cu_draft = np.cumsum(num_draft_tokens, dtype=np.int32)
+    target_indices: list[int] = []
+    bonus_indices: list[int] = []
+    draft_ids: list[int] = []
+    start = 0
+    for d in num_draft_tokens:
+        target_indices.extend(range(start, start + d))
+        bonus_indices.append(start + d)
+        draft_ids.extend([42] * d)
+        start += d + 1
+    return SpecDecodeMetadata(
+        draft_token_ids=torch.tensor(draft_ids, dtype=torch.int32),
+        num_draft_tokens=num_draft_tokens,
+        cu_num_draft_tokens=torch.tensor(cu_draft, dtype=torch.int32),
+        cu_num_sampled_tokens=torch.tensor(cu_sampled, dtype=torch.int32),
+        target_logits_indices=torch.tensor(target_indices, dtype=torch.int32),
+        bonus_logits_indices=torch.tensor(bonus_indices, dtype=torch.int32),
+        logits_indices=torch.arange(int(cu_sampled[-1]), dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    "num_draft_tokens,width",
+    [
+        pytest.param([3, 0, 0], 4, id="ragged-300"),
+        pytest.param([2, 1, 0], 4, id="ragged-210"),
+        pytest.param([1, 0, 2, 0], 4, id="ragged-1020"),
+        pytest.param([0], 4, id="bs1-d0"),
+    ],
+)
+def test_stale_tails_must_not_alias_real_logit_rows(num_draft_tokens, width):
+    """_get_logprobs_tensors must not alias invalid tail positions
+    to real logit rows when sampled_token_ids has non-PLACEHOLDER tails.
+
+    This tests logprobs-only corruption: when logprobs are requested
+    and invalid tail slots contain non-PLACEHOLDER token IDs (e.g. 0),
+    the clamp-based indexing silently reads logprobs from another
+    request's logit rows.
+
+    This can happen when GPUModelRunner fails to zero _draft_token_ids
+    (e.g. sync scheduling with input_fits_in_drafter=False), causing
+    leftover draft proposals from a previous scheduler step to
+    propagate into SpecDecodeMetadata.
+
+    Example with num_draft_tokens=[0, 2] (two requests) and width=3:
+
+      sampled_token_ids (tails are 0, not PLACEHOLDER):
+        req0: [0, 0, 0]    # 0 draft + 1 bonus = 1 valid, 2 invalid tails
+        req1: [0, 0, 0]    # 2 draft + 1 bonus = 3 valid, 0 tail
+
+      The size of the first dimension of final_logits
+      is the total number of sampled tokens (1 + 3 = 4).
+
+      final_logits (flattened sampled rows, shape [4, vocab_size]):
+        row 0: req0 bonus logits           ← req0's data
+        row 1: req1 draft-0 target logits  ← req1's data
+        row 2: req1 draft-1 target logits  ← req1's data
+        row 3: req1 bonus logits           ← req1's data
+
+      _get_logprobs_tensors computes flat indices per [batch, width]:
+        req0: [0, 1, 2]      # only [0] is valid; [1, 2] are invalid tails
+        req1: [1, 2, 3]      # all valid
+
+      _get_logprobs_tensors will use:
+      clamp_(max=final_logits.shape[0] - 1) = clamp_(max=3)
+
+      That means:
+      Indices [1, 2] for req0 are already <= 3, so clamp_ does nothing.
+      They silently read rows 1 and 2 which belong to req1:
+        --> req0 gets logprobs computed from req1's target logits
+        --> cross-request information leakage (privacy + correctness)
+    """
+    sampler = Sampler(logprobs_mode="processed_logits")
+    rej = RejectionSampler(sampler)
+    metadata = _build_logprobs_metadata(num_draft_tokens)
+    total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+
+    target_ids = metadata.target_logits_indices.cpu().tolist()
+    target_logits = (
+        torch.empty((0, 2), dtype=torch.float32)
+        if not target_ids
+        else torch.stack([torch.full((2,), float(i)) for i in target_ids])
+    )
+    bonus_ids = metadata.bonus_logits_indices.cpu().tolist()
+    bonus_logits = torch.stack([torch.full((2,), float(i)) for i in bonus_ids])
+    logits = torch.zeros((total_rows, 2), dtype=torch.float32)
+
+    # Stale tails: 0 instead of PLACEHOLDER (bug simulation)
+    sampled_token_ids = torch.zeros((len(num_draft_tokens), width), dtype=torch.int32)
+
+    captured = {}
+
+    def _capture(logprobs, num_logprobs, token_ids):
+        captured["rows"] = logprobs[:, 0].clone()
+        n = token_ids.shape[0]
+        return LogprobsTensors(
+            logprob_token_ids=torch.zeros((n, 1), dtype=torch.int64),
+            logprobs=torch.zeros((n, 1), dtype=torch.float32),
+            selected_token_ranks=torch.zeros((n,), dtype=torch.int32),
+        )
+
+    rej.sampler.gather_logprobs = _capture
+    rej._get_logprobs_tensors(
+        max_num_logprobs=1,
+        metadata=metadata,
+        logits=logits,
+        target_logits=target_logits,
+        bonus_logits=bonus_logits,
+        sampled_token_ids=sampled_token_ids,
+    )
+
+    rows = captured["rows"]
+    # Build mask for invalid tail positions (j >= num_draft + 1)
+    invalid_mask = torch.tensor(
+        [j >= d + 1 for d in num_draft_tokens for j in range(width)], dtype=torch.bool
+    )
+    invalid_rows = rows[invalid_mask]
+    assert torch.all(invalid_rows < 0), (
+        f"Invalid tails must not alias real logit rows, got: {invalid_rows.tolist()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "num_draft_tokens,width",
+    [
+        pytest.param([3, 0, 2], 4, id="ragged-302"),
+        pytest.param([0, 0, 0], 1, id="all-zero"),
+        pytest.param([5], 6, id="bs1-k5"),
+    ],
+)
+def test_logprobs_ragged_parse_output_alignment(num_draft_tokens, width):
+    """Logprobs pipeline: _get_logprobs_tensors + parse_output must produce
+    correct per-request token counts and aligned logprobs for ragged batches."""
+    batch_size = len(num_draft_tokens)
+    vocab_size = 4
+    sampler = Sampler(logprobs_mode="processed_logits")
+    rej = RejectionSampler(sampler)
+    metadata = _build_logprobs_metadata(num_draft_tokens)
+    total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+
+    target_ids = metadata.target_logits_indices
+    target_logits = (
+        torch.empty((0, vocab_size), dtype=torch.float32)
+        if len(target_ids) == 0
+        else torch.randn(len(target_ids), vocab_size)
+    )
+    bonus_logits = torch.randn(len(metadata.bonus_logits_indices), vocab_size)
+    logits = torch.randn(total_rows, vocab_size)
+    sampled = torch.full((batch_size, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    for i, d in enumerate(num_draft_tokens):
+        sampled[i, : d + 1] = torch.randint(0, vocab_size, (d + 1,))
+
+    lp = rej._get_logprobs_tensors(
+        1, metadata, logits, target_logits, bonus_logits, sampled
+    )
+    outputs, olp = RejectionSampler.parse_output(
+        sampled, vocab_size=vocab_size, logprobs_tensors=lp
+    )
+    expected_lens = [d + 1 for d in num_draft_tokens]
+    assert [len(r) for r in outputs] == expected_lens
+    assert olp is not None
+    assert olp.logprobs.shape[0] == sum(expected_lens)
+    expected_cu = [0] + np.cumsum(expected_lens, dtype=np.int32).tolist()
+    assert olp.cu_num_generated_tokens == expected_cu
+
+
+def test_zero_drafts_accept_when_target_matches(rejection_sampler):
+    """Draft tokens all 0 (drafter skip) and target also favors 0:
+    all drafts accepted + bonus appended."""
+    spec_tokens = [[0, 0, 0]]
+    output_tokens = [[0, 0, 0, 99]]
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(output_tokens)
+    bonus = torch.tensor([99], device=logits.device)
+    sd_meta = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus)
+    output = rejection_sampler(
+        sd_meta, draft_probs=None, logits=logits, sampling_metadata=metadata
+    )
+    row = output.sampled_token_ids[0].tolist()
+    real = [t for t in row if t != PLACEHOLDER_TOKEN_ID]
+    assert real == [0, 0, 0, 99]
+
+
+def test_zero_drafts_reject_when_target_differs(rejection_sampler):
+    """Draft tokens all 0 (drafter skip) but target favors 5:
+    first draft rejected immediately."""
+    spec_tokens = [[0, 0, 0]]
+    output_tokens = [[5, 0, 0, 99]]
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(output_tokens)
+    bonus = torch.tensor([99], device=logits.device)
+    sd_meta = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus)
+    output = rejection_sampler(
+        sd_meta, draft_probs=None, logits=logits, sampling_metadata=metadata
+    )
+    row = output.sampled_token_ids[0].tolist()
+    real = [t for t in row if t != PLACEHOLDER_TOKEN_ID]
+    assert real == [5]
+
+
+def test_parse_output_filters_oov_and_placeholder():
+    """parse_output filters element-wise: each position is independently
+    checked against (token != PLACEHOLDER) and (token < vocab_size).
+    Both PLACEHOLDER (-1) and OOV (>= vocab_size) are removed."""
+    ids = torch.tensor(
+        [
+            # 5: valid, -1: placeholder, 120: OOV (>=100), 7: valid --> [5, 7]
+            [5, PLACEHOLDER_TOKEN_ID, 120, 7],
+            # 9: valid, 11: valid, -1: placeholder, 200: OOV --> [9, 11]
+            [9, 11, PLACEHOLDER_TOKEN_ID, 200],
+            [159, 57, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+    )
+    out, _ = RejectionSampler.parse_output(ids, vocab_size=100)
+    assert out == [[5, 7], [9, 11], [57]]
