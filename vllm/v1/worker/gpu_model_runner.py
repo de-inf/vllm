@@ -751,11 +751,13 @@ class GPUModelRunner(
         # with dedicated stream for overlapping and event for coordination.
         self.valid_sampled_token_count_event: torch.Event | None = None
         self.valid_sampled_token_count_copy_stream: torch.cuda.Stream | None = None
+        self.valid_sampled_token_req_ids: list[str] | None = None
         # We also copy the drafted tokens to the CPU asynchronously,
         # in case we need them for structured outputs.
         self.draft_token_ids_event: torch.Event | None = None
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
+        self.valid_sampled_prev_num_draft_len_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
@@ -770,6 +772,12 @@ class GPUModelRunner(
                 self.valid_sampled_token_count_event = torch.Event()
                 self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
                 self.valid_sampled_token_count_cpu = torch.empty(
+                    self.max_num_reqs,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
+                self.valid_sampled_prev_num_draft_len_cpu = torch.empty(
                     self.max_num_reqs,
                     dtype=torch.int64,
                     device="cpu",
@@ -1149,7 +1157,10 @@ class GPUModelRunner(
 
         # Wait until valid_sampled_tokens_count is copied to cpu,
         # then use it to update actual num_computed_tokens of each request.
-        valid_sampled_token_count = self._get_valid_sampled_token_count()
+        (
+            valid_sampled_token_count,
+            valid_sampled_prev_num_draft_len,
+        ) = self._get_valid_sampled_token_count_and_prev_draft_len()
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -1159,7 +1170,7 @@ class GPUModelRunner(
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
-            if req_state.prev_num_draft_len and self.use_async_scheduling:
+            if self.use_async_scheduling:
                 # prev_num_draft_len is used in async scheduling mode with
                 # spec decode. it indicates if need to update num_computed_tokens
                 # of the request. for example:
@@ -1173,48 +1184,68 @@ class GPUModelRunner(
                 # the spec tokens length, but in third step it contains the
                 # spec tokens length. we only need to update num_computed_tokens
                 # when prev_num_draft_len > 0.
-                if req_index is None:
-                    req_state.prev_num_draft_len = 0
+                assert self.input_batch.prev_req_id_to_index is not None
+                prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
+                if prev_req_index >= len(
+                    valid_sampled_token_count
+                ) or prev_req_index >= len(valid_sampled_prev_num_draft_len):
+                    msg = (
+                        "Invalid async sampled-count index: "
+                        f"req_id={req_id} req_idx={i} "
+                        f"prev_req_index={prev_req_index} "
+                        f"count_len={len(valid_sampled_token_count)} "
+                        f"prev_draft_len_len={len(valid_sampled_prev_num_draft_len)}"
+                    )
+                    if _mtp_fail_fast_enabled():
+                        raise AssertionError(msg)
+                    if _mtp_debug_enabled(i):
+                        logger.warning("[MTP-DBG async-anomaly] %s", msg)
                 else:
-                    assert self.input_batch.prev_req_id_to_index is not None
-                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
-                    num_accepted = valid_sampled_token_count[prev_req_index] - 1
-                    if num_accepted < 0 or num_accepted > req_state.prev_num_draft_len:
-                        msg = (
-                            "Invalid async accepted-token bookkeeping: "
-                            f"req_id={req_id} req_idx={i} "
-                            f"prev_req_index={prev_req_index} "
-                            f"num_accepted={num_accepted} "
-                            f"prev_num_draft_len={req_state.prev_num_draft_len} "
-                            f"valid_sampled_token_count="
-                            f"{valid_sampled_token_count[prev_req_index]}"
-                        )
-                        if _mtp_fail_fast_enabled():
-                            raise AssertionError(msg)
-                        if _mtp_debug_enabled(i):
-                            logger.warning("[MTP-DBG async-anomaly] %s", msg)
-                    num_rejected = req_state.prev_num_draft_len - num_accepted
-                    prev_num_computed_tokens = num_computed_tokens
-                    num_computed_tokens -= num_rejected
-                    if (
-                        num_computed_tokens < 0
-                        or num_computed_tokens > self.max_model_len
-                    ):
-                        msg = (
-                            "Invalid async num_computed_tokens transition: "
-                            f"req_id={req_id} req_idx={i} "
-                            f"prev_num_computed={prev_num_computed_tokens} "
-                            f"num_rejected={num_rejected} "
-                            f"new_num_computed={num_computed_tokens} "
-                            f"max_model_len={self.max_model_len} "
-                            f"prev_num_draft_len={req_state.prev_num_draft_len} "
-                            f"num_accepted={num_accepted}"
-                        )
-                        if _mtp_fail_fast_enabled():
-                            raise AssertionError(msg)
-                        if _mtp_debug_enabled(i):
-                            logger.warning("[MTP-DBG async-anomaly] %s", msg)
-                    req_state.output_token_ids.extend([-1] * num_accepted)
+                    prev_num_draft_len = valid_sampled_prev_num_draft_len[
+                        prev_req_index
+                    ]
+                    if prev_num_draft_len > 0:
+                        num_accepted = valid_sampled_token_count[prev_req_index] - 1
+                        if num_accepted < 0 or num_accepted > prev_num_draft_len:
+                            msg = (
+                                "Invalid async accepted-token bookkeeping: "
+                                f"req_id={req_id} req_idx={i} "
+                                f"prev_req_index={prev_req_index} "
+                                f"num_accepted={num_accepted} "
+                                f"prev_num_draft_len={prev_num_draft_len} "
+                                f"live_prev_num_draft_len="
+                                f"{req_state.prev_num_draft_len} "
+                                f"valid_sampled_token_count="
+                                f"{valid_sampled_token_count[prev_req_index]}"
+                            )
+                            if _mtp_fail_fast_enabled():
+                                raise AssertionError(msg)
+                            if _mtp_debug_enabled(i):
+                                logger.warning("[MTP-DBG async-anomaly] %s", msg)
+                        num_rejected = prev_num_draft_len - num_accepted
+                        prev_num_computed_tokens = num_computed_tokens
+                        num_computed_tokens -= num_rejected
+                        if (
+                            num_computed_tokens < 0
+                            or num_computed_tokens > self.max_model_len
+                        ):
+                            msg = (
+                                "Invalid async num_computed_tokens transition: "
+                                f"req_id={req_id} req_idx={i} "
+                                f"prev_num_computed={prev_num_computed_tokens} "
+                                f"num_rejected={num_rejected} "
+                                f"new_num_computed={num_computed_tokens} "
+                                f"max_model_len={self.max_model_len} "
+                                f"prev_num_draft_len={prev_num_draft_len} "
+                                f"live_prev_num_draft_len="
+                                f"{req_state.prev_num_draft_len} "
+                                f"num_accepted={num_accepted}"
+                            )
+                            if _mtp_fail_fast_enabled():
+                                raise AssertionError(msg)
+                            if _mtp_debug_enabled(i):
+                                logger.warning("[MTP-DBG async-anomaly] %s", msg)
+                        req_state.output_token_ids.extend([-1] * num_accepted)
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -4371,30 +4402,48 @@ class GPUModelRunner(
         if self.valid_sampled_token_count_event is None:
             return
 
+        req_ids = self.input_batch.req_ids
         default_stream = torch.cuda.current_stream()
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
             counts = valid_sampled_tokens_count
+            num_reqs = counts.shape[0]
+            self.valid_sampled_token_req_ids = req_ids[:num_reqs].copy()
             counts_cpu = self.valid_sampled_token_count_cpu
+            prev_num_draft_len_cpu = self.valid_sampled_prev_num_draft_len_cpu
             assert counts_cpu is not None
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
+            assert prev_num_draft_len_cpu is not None
+            counts_cpu[:num_reqs].copy_(counts, non_blocking=True)
+            prev_num_draft_len_cpu[:num_reqs] = torch.tensor(
+                [len(self.input_batch.spec_token_ids[i]) for i in range(num_reqs)],
+                dtype=torch.int64,
+                device="cpu",
+            )
             self.valid_sampled_token_count_event.record()
 
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
-    def _get_valid_sampled_token_count(self) -> list[int]:
+    def _get_valid_sampled_token_count_and_prev_draft_len(
+        self,
+    ) -> tuple[list[int], list[int]]:
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
         if sampled_count_event is None or prev_sampled_token_ids is None:
-            return []
+            return [], []
 
         counts_cpu = self.valid_sampled_token_count_cpu
+        prev_num_draft_len_cpu = self.valid_sampled_prev_num_draft_len_cpu
         assert counts_cpu is not None
+        assert prev_num_draft_len_cpu is not None
         sampled_count_event.synchronize()
-        return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+        num_reqs = prev_sampled_token_ids.shape[0]
+        return (
+            counts_cpu[:num_reqs].tolist(),
+            prev_num_draft_len_cpu[:num_reqs].tolist(),
+        )
 
     def propose_draft_token_ids(
         self,
