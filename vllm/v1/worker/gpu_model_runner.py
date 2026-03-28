@@ -202,6 +202,20 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _mtp_debug_enabled(req_idx: int) -> bool:
+    if os.getenv("VLLM_MTP_DEBUG", "0") != "1":
+        return False
+    if os.getenv("LOCAL_RANK", "0") != os.getenv("VLLM_MTP_DEBUG_LOCAL_RANK", "0"):
+        return False
+    debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+    return req_idx == debug_req_idx
+
+
+def _mtp_fail_fast_enabled() -> bool:
+    return os.getenv("VLLM_MTP_FAIL_FAST", "1") == "1"
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -1297,11 +1311,36 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
+        raw_num_accepted_tokens = self.num_accepted_tokens.gpu[:num_reqs].clone()
+
+        sampled_rows = output_token_ids
+        is_placeholder = sampled_rows.eq(-1)
+        seen_placeholder = is_placeholder.cumsum(dim=1).gt(0)
+        valid_after_placeholder = (~is_placeholder) & seen_placeholder
+        sparse_row_mask = valid_after_placeholder.any(dim=1)
+        zero_accepted_mask = raw_num_accepted_tokens.eq(0)
+        invalid_accept_mask = sparse_row_mask | zero_accepted_mask
+        if invalid_accept_mask.any():
+            first_bad_idx = int(
+                torch.nonzero(invalid_accept_mask, as_tuple=False)[0].item()
+            )
+            bad_row = sampled_rows[first_bad_idx].tolist()
+            pre_clamp_accept = int(raw_num_accepted_tokens[first_bad_idx].item())
+            msg = (
+                "Invalid speculative acceptance row detected: "
+                f"req_idx={first_bad_idx} pre_clamp_accepted={pre_clamp_accept} "
+                f"sparse_row={bool(sparse_row_mask[first_bad_idx].item())} "
+                f"row={bad_row}"
+            )
+            if _mtp_fail_fast_enabled():
+                raise AssertionError(msg)
+            if _mtp_debug_enabled(first_bad_idx):
+                logger.warning("[MTP-DBG accepted-anomaly] %s", msg)
+
         # In speculative decode, accepted tokens include the bonus token,
         # so valid range is at least 1. Some placeholder patterns can
         # otherwise produce 0, which breaks downstream Mamba state logic.
         self.num_accepted_tokens.gpu[:num_reqs].clamp_(min=1)
-        raw_num_accepted_tokens = self.num_accepted_tokens.gpu[:num_reqs].clone()
         # Clamp accepted-token counts to the valid context budget for each
         # request. Near max_model_len, speculative scheduling can include
         # positions that are later masked out; using those slots to advance
@@ -1316,32 +1355,41 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = torch.minimum(
             self.num_accepted_tokens.gpu[:num_reqs], max_new_tokens_t
         )
-        if (
-            os.getenv("VLLM_MTP_DEBUG", "0") == "1"
-            and os.getenv("LOCAL_RANK", "0")
-            == os.getenv("VLLM_MTP_DEBUG_LOCAL_RANK", "0")
-            and num_reqs > 0
-        ):
+        if num_reqs > 0:
             debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
-            if debug_req_idx < num_reqs:
+            if debug_req_idx < num_reqs and _mtp_debug_enabled(debug_req_idx):
                 num_computed = int(
                     self.input_batch.num_computed_tokens_cpu[debug_req_idx]
                 )
                 max_new = int(max_new_tokens[debug_req_idx])
                 raw_accept = int(raw_num_accepted_tokens[debug_req_idx].item())
                 clamped_accept = int(self.num_accepted_tokens.gpu[debug_req_idx].item())
+                sampled_row = output_token_ids[debug_req_idx].tolist()
+                has_leading_placeholder = len(sampled_row) > 0 and sampled_row[0] == -1
+                has_sparse_gap = any(
+                    tok != -1 and -1 in sampled_row[:pos]
+                    for pos, tok in enumerate(sampled_row)
+                )
                 force_debug = os.getenv("VLLM_MTP_DEBUG_ALL_STEPS", "0") == "1"
                 near_boundary = max_new <= (self.num_spec_tokens + 6)
-                if force_debug or near_boundary:
+                if (
+                    force_debug
+                    or near_boundary
+                    or has_leading_placeholder
+                    or has_sparse_gap
+                ):
                     logger.warning(
                         "[MTP-DBG accepted] req_idx=%d num_computed=%d max_new=%d "
-                        "raw_accepted=%d clamped_accepted=%d sampled_row=%s",
+                        "pre_clamp_accepted=%d clamped_accepted=%d "
+                        "leading_placeholder=%s sparse_row=%s sampled_row=%s",
                         debug_req_idx,
                         num_computed,
                         max_new,
                         raw_accept,
                         clamped_accept,
-                        output_token_ids[debug_req_idx].tolist(),
+                        has_leading_placeholder,
+                        has_sparse_gap,
+                        sampled_row,
                     )
         spec_decode_active = bool(scheduler_output.scheduled_spec_decode_tokens)
         if self.needs_prefill_as_decode_slots and spec_decode_active:

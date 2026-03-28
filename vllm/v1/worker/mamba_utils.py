@@ -33,6 +33,10 @@ def _mtp_debug_enabled(req_idx: int) -> bool:
     return req_idx == debug_req_idx
 
 
+def _mtp_fail_fast_enabled() -> bool:
+    return os.getenv("VLLM_MTP_FAIL_FAST", "1") == "1"
+
+
 @triton.jit
 def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
@@ -187,13 +191,24 @@ def preprocess_mamba(
     copy_bufs.offset = 0
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
+        accepted_cpu = int(input_batch.num_accepted_tokens_cpu[i])
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+        if accepted_cpu < 1 or accepted_cpu > num_scheduled_tokens:
+            msg = (
+                "Invalid num_accepted_tokens before mamba preprocess: "
+                f"req_id={req_id} req_idx={i} accepted={accepted_cpu} "
+                f"num_scheduled={num_scheduled_tokens}"
+            )
+            if _mtp_fail_fast_enabled():
+                raise AssertionError(msg)
+            if _mtp_debug_enabled(i):
+                logger.warning("[MTP-DBG preprocess-anomaly] %s", msg)
         prev_state_idx = mamba_state_idx.get(req_id)
         if prev_state_idx is None:
             # new / resumed request, no previous state
             # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
-        num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
         num_blocks: int = (
             cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
             + num_speculative_blocks
@@ -278,10 +293,32 @@ def postprocess_mamba(
         num_draft_tokens = len(scheduled_spec_decode_tokens_dict.get(req_id, []))
         num_scheduled_tokens = num_scheduled_tokens_dict[req_id]
         num_accepted_tokens = num_accepted_tokens_cpu[i]
+        if num_accepted_tokens < 1 or num_accepted_tokens > num_scheduled_tokens:
+            msg = (
+                "Invalid num_accepted_tokens before mamba postprocess: "
+                f"req_id={req_id} req_idx={i} accepted={int(num_accepted_tokens)} "
+                f"num_scheduled={num_scheduled_tokens}"
+            )
+            if _mtp_fail_fast_enabled():
+                raise AssertionError(msg)
+            if _mtp_debug_enabled(i):
+                logger.warning("[MTP-DBG postprocess-anomaly] %s", msg)
         num_tokens_running_state = (
             num_computed_tokens + num_scheduled_tokens - num_draft_tokens
         )
         new_num_computed_tokens = num_tokens_running_state + num_accepted_tokens - 1
+        if new_num_computed_tokens < num_computed_tokens:
+            msg = (
+                "Non-monotonic new_num_computed_tokens in mamba postprocess: "
+                f"req_id={req_id} req_idx={i} num_computed={num_computed_tokens} "
+                f"num_scheduled={num_scheduled_tokens} num_draft={num_draft_tokens} "
+                f"num_accepted={int(num_accepted_tokens)} "
+                f"new_num_computed={int(new_num_computed_tokens)}"
+            )
+            if _mtp_fail_fast_enabled():
+                raise AssertionError(msg)
+            if _mtp_debug_enabled(i):
+                logger.warning("[MTP-DBG postprocess-anomaly] %s", msg)
         aligned_new_computed_tokens = (
             new_num_computed_tokens // mamba_spec.block_size * mamba_spec.block_size
         )

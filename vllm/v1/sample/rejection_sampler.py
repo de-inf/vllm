@@ -37,6 +37,10 @@ def _mtp_debug_enabled(req_idx: int) -> bool:
     return req_idx == debug_req_idx
 
 
+def _mtp_fail_fast_enabled() -> bool:
+    return os.getenv("VLLM_MTP_FAIL_FAST", "1") == "1"
+
+
 class RejectionSampler(nn.Module):
     """
     The implementation strictly follows the algorithm described in
@@ -158,7 +162,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
-        self._debug_check_sampled_row_invariants(
+        self._check_sampled_row_invariants(
             output_token_ids,
             target_logits.shape[-1],
         )
@@ -179,38 +183,41 @@ class RejectionSampler(nn.Module):
             logprobs_tensors=logprobs_tensors,
         )
 
-    def _debug_check_sampled_row_invariants(
+    def _check_sampled_row_invariants(
         self,
         sampled_token_ids: torch.Tensor,
         vocab_size: int,
     ) -> None:
         num_reqs = sampled_token_ids.shape[0]
-        debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
-        if debug_req_idx >= num_reqs or not _mtp_debug_enabled(debug_req_idx):
+        first_violation: tuple[int, list[int], list[int]] | None = None
+
+        for req_idx in range(num_reqs):
+            row = sampled_token_ids[req_idx].tolist()
+            seen_placeholder = False
+            violation_positions: list[int] = []
+            for pos, tok in enumerate(row):
+                is_valid = tok != PLACEHOLDER_TOKEN_ID and tok < vocab_size
+                if tok == PLACEHOLDER_TOKEN_ID:
+                    seen_placeholder = True
+                elif seen_placeholder and is_valid:
+                    violation_positions.append(pos)
+            if violation_positions:
+                first_violation = (req_idx, violation_positions, row)
+                break
+
+        if first_violation is None:
             return
 
-        row = sampled_token_ids[debug_req_idx]
-        row_list = row.tolist()
-        seen_placeholder = False
-        violation_positions: list[int] = []
-        for pos, tok in enumerate(row_list):
-            is_valid = tok != PLACEHOLDER_TOKEN_ID and tok < vocab_size
-            if tok == PLACEHOLDER_TOKEN_ID:
-                seen_placeholder = True
-            elif seen_placeholder and is_valid:
-                violation_positions.append(pos)
-
-        if not violation_positions:
-            return
-
-        logger.warning(
-            "[MTP-DBG rejection-row] req_idx=%d violation_positions=%s row=%s "
-            "vocab_size=%d",
-            debug_req_idx,
-            violation_positions[:8],
-            row_list,
-            vocab_size,
+        req_idx, violation_positions, row = first_violation
+        msg = (
+            "Invalid rejection sampler row: "
+            f"req_idx={req_idx} violation_positions={violation_positions[:8]} "
+            f"row={row} vocab_size={vocab_size}"
         )
+        if _mtp_fail_fast_enabled():
+            raise AssertionError(msg)
+        if _mtp_debug_enabled(req_idx):
+            logger.warning("[MTP-DBG rejection-row] %s", msg)
 
     def _get_logprobs_tensors(
         self,
