@@ -1297,6 +1297,10 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
+        # In speculative decode, accepted tokens include the bonus token,
+        # so valid range is at least 1. Some placeholder patterns can
+        # otherwise produce 0, which breaks downstream Mamba state logic.
+        self.num_accepted_tokens.gpu[:num_reqs].clamp_(min=1)
         raw_num_accepted_tokens = self.num_accepted_tokens.gpu[:num_reqs].clone()
         # Clamp accepted-token counts to the valid context budget for each
         # request. Near max_model_len, speculative scheduling can include
