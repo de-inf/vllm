@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.worker.mamba_utils import preprocess_mamba
+from vllm.v1.worker.mamba_utils import postprocess_mamba, preprocess_mamba
 
 
 def _make_scheduler_output(
@@ -66,3 +68,83 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
         )
 
     assert mamba_state_idx == {"keep": 99}
+
+
+def test_preprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    spec = MagicMock(block_size=64, num_speculative_blocks=0)
+    cache_config = MagicMock(enable_prefix_caching=True)
+    input_batch = MagicMock(req_ids=["req_0"], num_accepted_tokens_cpu=[5])
+    req_state = MagicMock(num_computed_tokens=0, block_ids=([0],))
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req_0": 2},
+        total_num_scheduled_tokens=2,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    with (
+        patch(
+            "vllm.v1.worker.mamba_utils.get_mamba_groups",
+            return_value=([0], spec),
+        ),
+        pytest.raises(
+            AssertionError,
+            match="Invalid num_accepted_tokens before mamba preprocess",
+        ),
+    ):
+        preprocess_mamba(
+            scheduler_output,
+            MagicMock(),
+            cache_config,
+            {},
+            input_batch,
+            {"req_0": req_state},
+            {},
+            (),
+            MagicMock(offset=0),
+        )
+
+
+def test_postprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    spec = MagicMock(block_size=64, num_speculative_blocks=0)
+    input_batch = MagicMock(req_ids=["req_0"], num_accepted_tokens_cpu=[5])
+    req_state = MagicMock(num_computed_tokens=16, block_ids=([0],))
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req_0": 2},
+        total_num_scheduled_tokens=2,
+        scheduled_spec_decode_tokens={"req_0": [7]},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    with (
+        patch(
+            "vllm.v1.worker.mamba_utils.get_mamba_groups",
+            return_value=([0], spec),
+        ),
+        pytest.raises(
+            AssertionError,
+            match="Invalid num_accepted_tokens before mamba postprocess",
+        ),
+    ):
+        postprocess_mamba(
+            scheduler_output,
+            MagicMock(),
+            input_batch,
+            {"req_0": req_state},
+            {"req_0": 0},
+            {},
+            (),
+            MagicMock(offset=0),
+        )

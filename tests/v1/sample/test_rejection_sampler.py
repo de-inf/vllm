@@ -1187,6 +1187,37 @@ def test_parse_output_filters_oov_and_placeholder():
     assert out == [[5, 7], [9, 11], [57]]
 
 
+def test_check_sampled_row_invariants_sparse_row_raises(rejection_sampler, monkeypatch):
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    sampled_token_ids = torch.tensor(
+        [
+            [PLACEHOLDER_TOKEN_ID, 7, PLACEHOLDER_TOKEN_ID],
+            [1, 2, PLACEHOLDER_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    with pytest.raises(AssertionError, match="Invalid rejection sampler row"):
+        rejection_sampler._check_sampled_row_invariants(
+            sampled_token_ids, vocab_size=100
+        )
+
+
+def test_check_sampled_row_invariants_contiguous_prefix_passes(rejection_sampler):
+    sampled_token_ids = torch.tensor(
+        [
+            [1, 2, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+            # OOV after placeholders should not be treated as a valid violation.
+            [PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, 150, 151],
+        ],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    rejection_sampler._check_sampled_row_invariants(sampled_token_ids, vocab_size=100)
+
+
 ################### Tests for Logprob Value Correctness ##################
 @pytest.mark.parametrize(
     "num_draft_tokens",
