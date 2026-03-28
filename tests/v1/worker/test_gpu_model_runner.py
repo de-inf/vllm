@@ -1380,3 +1380,125 @@ def test_calc_spec_decode_metadata_request_order_permutation_invariance() -> Non
         assert bonus_b[req_b] == (
             tgt_b[req_b][-1] + 1 if tgt_b[req_b] else bonus_b[req_b]
         )
+
+
+@pytest.mark.parametrize(
+    "num_draft_tokens,schedule_gaps",
+    [
+        pytest.param([2, 0], [0, 0], id="transition-20"),
+        pytest.param([0, 2], [0, 0], id="transition-02"),
+        pytest.param([3, 0, 2, 0], [0, 0, 0, 0], id="alternating-3020"),
+        pytest.param([0, 0, 0], [0, 0, 0], id="all-bonus-only"),
+        pytest.param([0], [0], id="bs1-bonus-only"),
+    ],
+)
+def test_calc_spec_decode_metadata_bonus_indices_at_boundary(
+    num_draft_tokens: list[int], schedule_gaps: list[int]
+) -> None:
+    """Verify bonus_logits_indices correctness when some requests have
+    num_draft_tokens=0 (the max_model_len boundary / drafter-skip scenario).
+
+    Each request's bonus row must be the LAST sampled row for that request
+    (at offset num_draft_tokens[i] within the request's sampled segment).
+    Bonus-only requests (0 drafts) must have their bonus at the FIRST row
+    of their segment, not aliased to another request's rows."""
+    from vllm.v1.sample.rejection_sampler import (
+        PLACEHOLDER_TOKEN_ID,
+        RejectionSampler,
+    )
+    from vllm.v1.sample.sampler import Sampler
+
+    num_draft_tokens_np = np.array(num_draft_tokens, dtype=np.int32)
+    cu_num_scheduled_tokens = _build_cu_num_scheduled_tokens_for_spec_test(
+        num_draft_tokens_np, schedule_gaps
+    )
+    max_idx = int(cu_num_scheduled_tokens[-1])
+
+    fake_runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        arange_np=np.arange(max_idx + 1, dtype=np.int32),
+        input_ids=SimpleNamespace(gpu=torch.arange(max_idx + 1, dtype=torch.int32)),
+    )
+    fake_runner._get_cumsum_and_arange = GPUModelRunner._get_cumsum_and_arange.__get__(
+        fake_runner, type(fake_runner)
+    )
+    metadata = GPUModelRunner._calc_spec_decode_metadata(
+        fake_runner, num_draft_tokens_np, cu_num_scheduled_tokens
+    )
+
+    batch_size = len(num_draft_tokens)
+    total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+    bonus_idx = metadata.bonus_logits_indices.cpu().tolist()
+    target_idx = metadata.target_logits_indices.cpu().tolist()
+
+    # Verify bonus indices: each must be the last row in its request segment
+    cu = [0] + metadata.cu_num_sampled_tokens.cpu().tolist()
+    for i in range(batch_size):
+        seg_start, seg_end = cu[i], cu[i + 1]
+        expected_bonus = seg_end - 1
+        assert bonus_idx[i] == expected_bonus, (
+            f"req {i}: bonus index should be {expected_bonus} "
+            f"(last in segment [{seg_start}, {seg_end})), got {bonus_idx[i]}"
+        )
+
+    # Verify no overlap between target and bonus indices
+    target_set = set(target_idx)
+    bonus_set = set(bonus_idx)
+    assert target_set.isdisjoint(bonus_set), (
+        f"Target and bonus indices overlap: {target_set & bonus_set}"
+    )
+
+    # Integration: pipe through _get_logprobs_tensors with unique-per-row
+    # logits and verify bonus-only requests get their own row's logprobs
+    vocab_size = 4
+    width = max(num_draft_tokens) + 1
+
+    # Each row gets a unique distribution (peak at row_idx % vocab_size)
+    all_logits = torch.zeros((total_rows, vocab_size), dtype=torch.float32)
+    for r in range(total_rows):
+        all_logits[r, r % vocab_size] = 10.0
+
+    target_logits = (
+        torch.empty((0, vocab_size), dtype=torch.float32)
+        if len(target_idx) == 0
+        else all_logits[metadata.target_logits_indices]
+    )
+    bonus_logits = all_logits[metadata.bonus_logits_indices]
+
+    sampled_token_ids = torch.full(
+        (batch_size, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+    )
+    for i, d in enumerate(num_draft_tokens):
+        for j in range(d + 1):
+            row = cu[i] + j
+            sampled_token_ids[i, j] = row % vocab_size
+
+    sampler = Sampler(logprobs_mode="raw_logprobs")
+    rej = RejectionSampler(sampler)
+    lp = rej._get_logprobs_tensors(
+        max_num_logprobs=0,
+        metadata=metadata,
+        logits=all_logits,
+        target_logits=target_logits,
+        bonus_logits=bonus_logits,
+        sampled_token_ids=sampled_token_ids,
+    )
+    _, olp = RejectionSampler.parse_output(
+        sampled_token_ids, vocab_size=vocab_size, logprobs_tensors=lp
+    )
+    assert olp is not None
+
+    # Check that each valid position's logprob comes from its own row
+    expected_logprobs = torch.log_softmax(all_logits, dim=-1)
+    flat_idx = 0
+    for i, d in enumerate(num_draft_tokens):
+        for j in range(d + 1):
+            row = cu[i] + j
+            token = sampled_token_ids[i, j].item()
+            expected_lp = expected_logprobs[row, token].item()
+            actual_lp = olp.logprobs[flat_idx, 0]
+            assert abs(actual_lp - expected_lp) < 1e-4, (
+                f"req {i} pos {j} (row {row}): expected {expected_lp:.6f}, "
+                f"got {actual_lp:.6f} — possible cross-request aliasing"
+            )
+            flat_idx += 1
