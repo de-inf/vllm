@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -25,6 +26,15 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _mtp_debug_enabled(req_idx: int) -> bool:
+    if os.getenv("VLLM_MTP_DEBUG", "0") != "1":
+        return False
+    if os.getenv("LOCAL_RANK", "0") != os.getenv("VLLM_MTP_DEBUG_LOCAL_RANK", "0"):
+        return False
+    debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+    return req_idx == debug_req_idx
 
 
 class RejectionSampler(nn.Module):
@@ -148,6 +158,10 @@ class RejectionSampler(nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
+        self._debug_check_sampled_row_invariants(
+            output_token_ids,
+            target_logits.shape[-1],
+        )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -163,6 +177,39 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+        )
+
+    def _debug_check_sampled_row_invariants(
+        self,
+        sampled_token_ids: torch.Tensor,
+        vocab_size: int,
+    ) -> None:
+        num_reqs = sampled_token_ids.shape[0]
+        debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+        if debug_req_idx >= num_reqs or not _mtp_debug_enabled(debug_req_idx):
+            return
+
+        row = sampled_token_ids[debug_req_idx]
+        row_list = row.tolist()
+        seen_placeholder = False
+        violation_positions: list[int] = []
+        for pos, tok in enumerate(row_list):
+            is_valid = tok != PLACEHOLDER_TOKEN_ID and tok < vocab_size
+            if tok == PLACEHOLDER_TOKEN_ID:
+                seen_placeholder = True
+            elif seen_placeholder and is_valid:
+                violation_positions.append(pos)
+
+        if not violation_positions:
+            return
+
+        logger.warning(
+            "[MTP-DBG rejection-row] req_idx=%d violation_positions=%s row=%s "
+            "vocab_size=%d",
+            debug_req_idx,
+            violation_positions[:8],
+            row_list,
+            vocab_size,
         )
 
     def _get_logprobs_tensors(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 from torch import nn
@@ -14,6 +15,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -48,6 +50,17 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
 # Added by the IBM Team, 2024
+
+logger = init_logger(__name__)
+
+
+def _mtp_debug_enabled(req_idx: int) -> bool:
+    if os.getenv("VLLM_MTP_DEBUG", "0") != "1":
+        return False
+    if os.getenv("LOCAL_RANK", "0") != os.getenv("VLLM_MTP_DEBUG_LOCAL_RANK", "0"):
+        return False
+    debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+    return req_idx == debug_req_idx
 
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
@@ -830,6 +843,38 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # Without caching, read and write in-place to the same blocks:
                 state_indices_tensor_d_input = state_indices_tensor_d
                 state_indices_tensor_d_output = state_indices_tensor_d
+
+            debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+            if _mtp_debug_enabled(debug_req_idx) and debug_req_idx < num_decodes:
+                qstart_pair = None
+                if query_start_loc_d is not None and query_start_loc_d.numel() > (
+                    debug_req_idx + 1
+                ):
+                    qstart_pair = query_start_loc_d[
+                        debug_req_idx : debug_req_idx + 2
+                    ].tolist()
+                accepted = None
+                if num_accepted_tokens is not None and num_accepted_tokens.numel() > (
+                    debug_req_idx
+                ):
+                    accepted = int(num_accepted_tokens[debug_req_idx].item())
+                input_state_idx = state_indices_tensor_d_input[debug_req_idx].tolist()
+                output_state_idx = state_indices_tensor_d_output[debug_req_idx].tolist()
+                logger.warning(
+                    "[MTP-DBG mixer2-decode] layer=%s req_idx=%d "
+                    "qstart_pair=%s accepted=%s input_state_idx=%s "
+                    "output_state_idx=%s num_decodes=%d num_decode_tokens=%d "
+                    "cache_mode=%s",
+                    self.prefix,
+                    debug_req_idx,
+                    qstart_pair,
+                    accepted,
+                    input_state_idx,
+                    output_state_idx,
+                    num_decodes,
+                    num_decode_tokens,
+                    self.cache_config.mamba_cache_mode if self.cache_config else None,
+                )
 
             # 2. Convolution sequence transformation
             hidden_states_B_C_d = causal_conv1d_update(
