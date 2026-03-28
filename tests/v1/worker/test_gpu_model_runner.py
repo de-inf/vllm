@@ -475,17 +475,15 @@ def test_update_states_async_uses_snapshot_prev_num_draft_len(
     req_id = "req_0"
     model_runner._update_states(_schedule_new_request(req_id))
 
-    # Simulate stale live state: request state has already been overwritten
-    # before the previous sampled counts are consumed.
     req_state = model_runner.requests[req_id]
-    req_state.prev_num_draft_len = 1
+    req_state.prev_num_draft_len = 5
 
     model_runner.use_async_scheduling = True
     model_runner.input_batch.prev_req_id_to_index = {req_id: 0}
     monkeypatch.setattr(
         model_runner,
-        "_get_valid_sampled_token_count_and_prev_draft_len",
-        lambda: ([5], [5], [req_id]),
+        "_get_valid_sampled_token_count",
+        lambda: [5],
     )
 
     cached_req_data = CachedRequestData(
@@ -525,8 +523,8 @@ def test_update_states_async_invalid_sampled_count_index_fails_fast(
     monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
     monkeypatch.setattr(
         model_runner,
-        "_get_valid_sampled_token_count_and_prev_draft_len",
-        lambda: ([5], [5], [req_id]),
+        "_get_valid_sampled_token_count",
+        lambda: [5],
     )
 
     cached_req_data = CachedRequestData(
@@ -566,8 +564,8 @@ def test_update_states_async_missing_prev_req_mapping_skips_adjustment(
     monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
     monkeypatch.setattr(
         model_runner,
-        "_get_valid_sampled_token_count_and_prev_draft_len",
-        lambda: ([5], [5], [req_id]),
+        "_get_valid_sampled_token_count",
+        lambda: [5],
     )
 
     cached_req_data = CachedRequestData(

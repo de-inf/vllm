@@ -129,9 +129,15 @@ def test_preprocess_mamba_normalizes_boundary_non_spec_step(monkeypatch):
         free_encoder_mm_hashes=[],
     )
 
-    with patch(
-        "vllm.v1.worker.mamba_utils.get_mamba_groups",
-        return_value=([0], spec),
+    with (
+        patch(
+            "vllm.v1.worker.mamba_utils.get_mamba_groups",
+            return_value=([0], spec),
+        ),
+        pytest.raises(
+            AssertionError,
+            match="Invalid num_accepted_tokens before mamba preprocess",
+        ),
     ):
         preprocess_mamba(
             scheduler_output,
@@ -144,8 +150,6 @@ def test_preprocess_mamba_normalizes_boundary_non_spec_step(monkeypatch):
             (),
             MagicMock(offset=0),
         )
-
-    assert int(input_batch.num_accepted_tokens_cpu[0]) == 1
 
 
 def test_preprocess_mamba_normalizes_placeholder_only_spec_step(monkeypatch):
@@ -166,9 +170,15 @@ def test_preprocess_mamba_normalizes_placeholder_only_spec_step(monkeypatch):
         free_encoder_mm_hashes=[],
     )
 
-    with patch(
-        "vllm.v1.worker.mamba_utils.get_mamba_groups",
-        return_value=([0], spec),
+    with (
+        patch(
+            "vllm.v1.worker.mamba_utils.get_mamba_groups",
+            return_value=([0], spec),
+        ),
+        pytest.raises(
+            AssertionError,
+            match="Invalid num_accepted_tokens before mamba preprocess",
+        ),
     ):
         preprocess_mamba(
             scheduler_output,
@@ -181,8 +191,6 @@ def test_preprocess_mamba_normalizes_placeholder_only_spec_step(monkeypatch):
             (),
             MagicMock(offset=0),
         )
-
-    assert int(input_batch.num_accepted_tokens_cpu[0]) == 1
 
 
 def test_postprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
