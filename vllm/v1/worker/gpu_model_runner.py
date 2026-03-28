@@ -1296,6 +1296,20 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
+        # Clamp accepted-token counts to the valid context budget for each
+        # request. Near max_model_len, speculative scheduling can include
+        # positions that are later masked out; using those slots to advance
+        # Mamba state selection can shift to an invalid state.
+        max_new_tokens = (
+            self.max_model_len - self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        )
+        np.maximum(max_new_tokens, 1, out=max_new_tokens)
+        max_new_tokens_t = torch.from_numpy(max_new_tokens).to(
+            self.device, non_blocking=True
+        )
+        self.num_accepted_tokens.gpu[:num_reqs] = torch.minimum(
+            self.num_accepted_tokens.gpu[:num_reqs], max_new_tokens_t
+        )
         spec_decode_active = bool(scheduler_output.scheduled_spec_decode_tokens)
         if self.needs_prefill_as_decode_slots and spec_decode_active:
             mamba_utils.update_accepted_tokens_for_prefill_as_decode(
