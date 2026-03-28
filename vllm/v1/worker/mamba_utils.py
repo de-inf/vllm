@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
 )
@@ -18,6 +20,17 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
+
+
+def _mtp_debug_enabled(req_idx: int) -> bool:
+    if os.getenv("VLLM_MTP_DEBUG", "0") != "1":
+        return False
+    if os.getenv("LOCAL_RANK", "0") != os.getenv("VLLM_MTP_DEBUG_LOCAL_RANK", "0"):
+        return False
+    debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+    return req_idx == debug_req_idx
 
 
 @triton.jit
@@ -198,7 +211,32 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
+        if _mtp_debug_enabled(i):
+            logger.warning(
+                "[MTP-DBG preprocess] req_id=%s req_idx=%d "
+                "num_computed=%d num_scheduled=%d num_accepted_cpu=%d "
+                "block_size=%d num_spec_blocks=%d prev_state_idx=%d curr_state_idx=%d",
+                req_id,
+                i,
+                req_state.num_computed_tokens,
+                num_scheduled_tokens,
+                int(input_batch.num_accepted_tokens_cpu[i]),
+                block_size,
+                num_speculative_blocks,
+                prev_state_idx,
+                curr_state_idx,
+            )
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+            if _mtp_debug_enabled(i):
+                logger.warning(
+                    "[MTP-DBG preprocess-copy] req_id=%s req_idx=%d "
+                    "src_block_idx=%d dst_block_idx=%d accept_token_bias=%d",
+                    req_id,
+                    i,
+                    prev_state_idx,
+                    curr_state_idx,
+                    int(input_batch.num_accepted_tokens_cpu[i] - 1),
+                )
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
@@ -247,11 +285,38 @@ def postprocess_mamba(
         aligned_new_computed_tokens = (
             new_num_computed_tokens // mamba_spec.block_size * mamba_spec.block_size
         )
+        if _mtp_debug_enabled(i):
+            logger.warning(
+                "[MTP-DBG postprocess] req_id=%s req_idx=%d "
+                "num_computed=%d num_scheduled=%d num_draft=%d num_accepted=%d "
+                "running_state_tokens=%d new_num_computed=%d "
+                "aligned_new=%d block_size=%d",
+                req_id,
+                i,
+                num_computed_tokens,
+                num_scheduled_tokens,
+                num_draft_tokens,
+                int(num_accepted_tokens),
+                num_tokens_running_state,
+                int(new_num_computed_tokens),
+                int(aligned_new_computed_tokens),
+                mamba_spec.block_size,
+            )
         # TODO: how to ensure all blocks that cache_blocks called are cached here?
         if aligned_new_computed_tokens >= num_tokens_running_state:
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
             src_block_idx = mamba_state_idx[req_id]
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
+            if _mtp_debug_enabled(i):
+                logger.warning(
+                    "[MTP-DBG postprocess-copy] req_id=%s req_idx=%d "
+                    "src_block_idx=%d dst_block_idx=%d accept_token_bias=%d",
+                    req_id,
+                    i,
+                    int(src_block_idx),
+                    int(dest_block_idx),
+                    int(accept_token_bias),
+                )
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,

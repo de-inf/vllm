@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -1296,6 +1297,7 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
+        raw_num_accepted_tokens = self.num_accepted_tokens.gpu[:num_reqs].clone()
         # Clamp accepted-token counts to the valid context budget for each
         # request. Near max_model_len, speculative scheduling can include
         # positions that are later masked out; using those slots to advance
@@ -1310,6 +1312,33 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = torch.minimum(
             self.num_accepted_tokens.gpu[:num_reqs], max_new_tokens_t
         )
+        if (
+            os.getenv("VLLM_MTP_DEBUG", "0") == "1"
+            and os.getenv("LOCAL_RANK", "0")
+            == os.getenv("VLLM_MTP_DEBUG_LOCAL_RANK", "0")
+            and num_reqs > 0
+        ):
+            debug_req_idx = int(os.getenv("VLLM_MTP_DEBUG_REQ_INDEX", "0"))
+            if debug_req_idx < num_reqs:
+                num_computed = int(
+                    self.input_batch.num_computed_tokens_cpu[debug_req_idx]
+                )
+                max_new = int(max_new_tokens[debug_req_idx])
+                raw_accept = int(raw_num_accepted_tokens[debug_req_idx].item())
+                clamped_accept = int(self.num_accepted_tokens.gpu[debug_req_idx].item())
+                force_debug = os.getenv("VLLM_MTP_DEBUG_ALL_STEPS", "0") == "1"
+                near_boundary = max_new <= (self.num_spec_tokens + 6)
+                if force_debug or near_boundary:
+                    logger.warning(
+                        "[MTP-DBG accepted] req_idx=%d num_computed=%d max_new=%d "
+                        "raw_accepted=%d clamped_accepted=%d sampled_row=%s",
+                        debug_req_idx,
+                        num_computed,
+                        max_new,
+                        raw_accept,
+                        clamped_accept,
+                        output_token_ids[debug_req_idx].tolist(),
+                    )
         spec_decode_active = bool(scheduler_output.scheduled_spec_decode_tokens)
         if self.needs_prefill_as_decode_slots and spec_decode_active:
             mamba_utils.update_accepted_tokens_for_prefill_as_decode(
