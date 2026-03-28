@@ -1185,3 +1185,148 @@ def test_parse_output_filters_oov_and_placeholder():
     )
     out, _ = RejectionSampler.parse_output(ids, vocab_size=100)
     assert out == [[5, 7], [9, 11], [57]]
+
+
+################### Tests for Logprob Value Correctness ##################
+@pytest.mark.parametrize(
+    "num_draft_tokens",
+    [
+        pytest.param([0], id="bs1-bonus-only"),
+        pytest.param([0, 0], id="bs2-bonus-only"),
+        pytest.param([2, 0], id="ragged-drafts-and-bonus-only"),
+        pytest.param([0, 3], id="ragged-bonus-only-then-drafts"),
+    ],
+)
+def test_logprob_values_correct_for_valid_positions(num_draft_tokens):
+    """Verify that logprob VALUES (not just shapes) are correct for valid
+    positions, especially bonus-only requests (num_draft_tokens=0).
+
+    This catches the bug at the max_model_len boundary where
+    input_fits_in_drafter flips to False: the transition step emits only
+    a bonus token, and its logprob must match log_softmax of the bonus
+    logit row — not an aliased value from another request."""
+    batch_size = len(num_draft_tokens)
+    vocab_size = 8
+    width = max(num_draft_tokens) + 1
+
+    metadata = _build_logprobs_metadata(num_draft_tokens)
+    total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+
+    torch.manual_seed(42)
+    target_logits = (
+        torch.empty((0, vocab_size), dtype=torch.float32)
+        if len(metadata.target_logits_indices) == 0
+        else torch.randn(len(metadata.target_logits_indices), vocab_size)
+    )
+    bonus_logits = torch.randn(len(metadata.bonus_logits_indices), vocab_size)
+    logits = torch.randn(total_rows, vocab_size)
+
+    sampled_token_ids = torch.full(
+        (batch_size, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+    )
+    for i, d in enumerate(num_draft_tokens):
+        sampled_token_ids[i, : d + 1] = torch.randint(0, vocab_size, (d + 1,))
+
+    sampler = Sampler(logprobs_mode="raw_logprobs")
+    rej = RejectionSampler(sampler)
+    lp = rej._get_logprobs_tensors(
+        max_num_logprobs=0,
+        metadata=metadata,
+        logits=logits,
+        target_logits=target_logits,
+        bonus_logits=bonus_logits,
+        sampled_token_ids=sampled_token_ids,
+    )
+    outputs, olp = RejectionSampler.parse_output(
+        sampled_token_ids, vocab_size=vocab_size, logprobs_tensors=lp
+    )
+
+    assert olp is not None
+
+    # Reconstruct expected logprobs by manually computing log_softmax on
+    # the correct logit rows for each valid position.
+    final_logits_manual = torch.zeros((total_rows, vocab_size), dtype=torch.float32)
+    final_logits_manual[metadata.target_logits_indices] = target_logits.float()
+    final_logits_manual[metadata.bonus_logits_indices] = bonus_logits.float()
+    expected_logprobs = torch.log_softmax(final_logits_manual, dim=-1)
+
+    flat_idx = 0
+    for i, d in enumerate(num_draft_tokens):
+        start_row = 0 if i == 0 else sum(num_draft_tokens[j] + 1 for j in range(i))
+        for pos in range(d + 1):
+            token_id = sampled_token_ids[i, pos].item()
+            expected_lp = expected_logprobs[start_row + pos, token_id].item()
+            # olp.logprobs[:, 0] is the sampled token logprob
+            actual_lp = olp.logprobs[flat_idx, 0]
+            assert abs(actual_lp - expected_lp) < 1e-4, (
+                f"req {i} pos {pos}: expected logprob {expected_lp:.6f}, "
+                f"got {actual_lp:.6f} (diff={abs(actual_lp - expected_lp):.6f})"
+            )
+            flat_idx += 1
+
+
+def test_bonus_only_logprob_not_aliased_across_requests():
+    """With num_draft_tokens=[0, 2], req0 is bonus-only. Its logprob must
+    come from its OWN bonus logit row (row 0), not from req1's target rows
+    (rows 1-2) or bonus row (row 3).
+
+    This is the exact scenario at the max_model_len boundary where one
+    request's drafter can't run (0 drafts) while another still has drafts."""
+    vocab_size = 8
+    num_draft_tokens = [0, 2]
+    width = 3
+
+    metadata = _build_logprobs_metadata(num_draft_tokens)
+    total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+
+    # Give each logit row a UNIQUE distribution so aliasing is detectable
+    torch.manual_seed(123)
+    row_logits = []
+    for r in range(total_rows):
+        row = torch.zeros(vocab_size, dtype=torch.float32)
+        row[r % vocab_size] = 10.0  # strong peak at different position per row
+        row_logits.append(row)
+    all_logits = torch.stack(row_logits)
+
+    target_logits = all_logits[metadata.target_logits_indices]
+    bonus_logits = all_logits[metadata.bonus_logits_indices]
+
+    # req0: bonus token = 0 (the peak of row 0)
+    # req1: draft tokens = [1, 2], bonus token = 3
+    sampled_token_ids = torch.full((2, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    sampled_token_ids[0, 0] = 0  # req0 bonus
+    sampled_token_ids[1, 0] = 1  # req1 draft-0
+    sampled_token_ids[1, 1] = 2  # req1 draft-1
+    sampled_token_ids[1, 2] = 3  # req1 bonus
+
+    sampler = Sampler(logprobs_mode="raw_logprobs")
+    rej = RejectionSampler(sampler)
+    lp = rej._get_logprobs_tensors(
+        max_num_logprobs=0,
+        metadata=metadata,
+        logits=all_logits,
+        target_logits=target_logits,
+        bonus_logits=bonus_logits,
+        sampled_token_ids=sampled_token_ids,
+    )
+    _, olp = RejectionSampler.parse_output(
+        sampled_token_ids, vocab_size=vocab_size, logprobs_tensors=lp
+    )
+
+    assert olp is not None
+
+    # req0's bonus logprob: log_softmax(row 0) at token 0
+    # row 0 has peak at position 0, so this should be close to 0 (high prob)
+    req0_bonus_lp = olp.logprobs[0, 0]
+    expected_lp = torch.log_softmax(all_logits[0], dim=-1)[0].item()
+    assert abs(req0_bonus_lp - expected_lp) < 1e-4, (
+        f"req0 bonus logprob should come from row 0 "
+        f"(expected {expected_lp:.4f}, got {req0_bonus_lp:.4f})"
+    )
+
+    # If aliased to row 1 (req1's draft-0), the logprob of token 0
+    # would be very different (row 1 peaks at position 1, not 0)
+    aliased_lp = torch.log_softmax(all_logits[1], dim=-1)[0].item()
+    assert abs(req0_bonus_lp - aliased_lp) > 1.0, (
+        "req0 logprob suspiciously close to row 1 — possible aliasing"
+    )
