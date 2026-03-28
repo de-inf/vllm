@@ -1160,7 +1160,11 @@ class GPUModelRunner(
         (
             valid_sampled_token_count,
             valid_sampled_prev_num_draft_len,
+            valid_sampled_req_ids,
         ) = self._get_valid_sampled_token_count_and_prev_draft_len()
+        sampled_req_id_to_index = {
+            req_id: i for i, req_id in enumerate(valid_sampled_req_ids)
+        }
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -1184,9 +1188,20 @@ class GPUModelRunner(
                 # the spec tokens length, but in third step it contains the
                 # spec tokens length. we only need to update num_computed_tokens
                 # when prev_num_draft_len > 0.
-                assert self.input_batch.prev_req_id_to_index is not None
-                prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
-                if prev_req_index >= len(
+                prev_req_index = sampled_req_id_to_index.get(req_id)
+                if prev_req_index is None:
+                    # There is no sampled-count snapshot for this request in
+                    # the previous batch (e.g. boundary transition). Skip
+                    # async accepted-token adjustment for this step.
+                    if _mtp_debug_enabled(i):
+                        logger.warning(
+                            "[MTP-DBG async-anomaly] Missing prev_req_index: "
+                            "req_id=%s req_idx=%d prev_count=%d",
+                            req_id,
+                            i,
+                            len(sampled_req_id_to_index),
+                        )
+                elif prev_req_index >= len(
                     valid_sampled_token_count
                 ) or prev_req_index >= len(valid_sampled_prev_num_draft_len):
                     msg = (
@@ -4427,22 +4442,25 @@ class GPUModelRunner(
 
     def _get_valid_sampled_token_count_and_prev_draft_len(
         self,
-    ) -> tuple[list[int], list[int]]:
+    ) -> tuple[list[int], list[int], list[str]]:
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
         if sampled_count_event is None or prev_sampled_token_ids is None:
-            return [], []
+            return [], [], []
 
         counts_cpu = self.valid_sampled_token_count_cpu
         prev_num_draft_len_cpu = self.valid_sampled_prev_num_draft_len_cpu
+        req_ids = self.valid_sampled_token_req_ids
         assert counts_cpu is not None
         assert prev_num_draft_len_cpu is not None
+        assert req_ids is not None
         sampled_count_event.synchronize()
         num_reqs = prev_sampled_token_ids.shape[0]
         return (
             counts_cpu[:num_reqs].tolist(),
             prev_num_draft_len_cpu[:num_reqs].tolist(),
+            req_ids[:num_reqs],
         )
 
     def propose_draft_token_ids(

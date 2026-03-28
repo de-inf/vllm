@@ -485,7 +485,7 @@ def test_update_states_async_uses_snapshot_prev_num_draft_len(
     monkeypatch.setattr(
         model_runner,
         "_get_valid_sampled_token_count_and_prev_draft_len",
-        lambda: ([5], [5]),
+        lambda: ([5], [5], [req_id]),
     )
 
     cached_req_data = CachedRequestData(
@@ -526,7 +526,7 @@ def test_update_states_async_invalid_sampled_count_index_fails_fast(
     monkeypatch.setattr(
         model_runner,
         "_get_valid_sampled_token_count_and_prev_draft_len",
-        lambda: ([5], [5]),
+        lambda: ([5], [5], [req_id]),
     )
 
     cached_req_data = CachedRequestData(
@@ -552,6 +552,48 @@ def test_update_states_async_invalid_sampled_count_index_fails_fast(
 
     with pytest.raises(AssertionError, match="Invalid async sampled-count index"):
         model_runner._update_states(scheduler_output)
+
+
+def test_update_states_async_missing_prev_req_mapping_skips_adjustment(
+    model_runner, dist_init, monkeypatch
+):
+    req_id = "req_0"
+    model_runner._update_states(_schedule_new_request(req_id))
+
+    model_runner.use_async_scheduling = True
+    # Request is absent from previous-index map in this boundary step.
+    model_runner.input_batch.prev_req_id_to_index = {}
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    monkeypatch.setattr(
+        model_runner,
+        "_get_valid_sampled_token_count_and_prev_draft_len",
+        lambda: ([5], [5], [req_id]),
+    )
+
+    cached_req_data = CachedRequestData(
+        req_ids=[req_id],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[100],
+        num_output_tokens=[0],
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached_req_data,
+        num_scheduled_tokens={req_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={req_id: []},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    model_runner._update_states(scheduler_output)
+    # Adjustment is skipped when no prev mapping exists.
+    assert model_runner.requests[req_id].num_computed_tokens == 100
 
 
 def test_kv_cache_stride_order(monkeypatch, model_runner):
