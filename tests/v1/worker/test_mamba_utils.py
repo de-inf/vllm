@@ -81,7 +81,7 @@ def test_preprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         num_scheduled_tokens={"req_0": 2},
         total_num_scheduled_tokens=2,
-        scheduled_spec_decode_tokens={},
+        scheduled_spec_decode_tokens={"req_0": [17]},
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
@@ -123,6 +123,43 @@ def test_preprocess_mamba_normalizes_boundary_non_spec_step(monkeypatch):
         num_scheduled_tokens={"req_0": 1},
         total_num_scheduled_tokens=1,
         scheduled_spec_decode_tokens={},  # No draft tokens this step.
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    with patch(
+        "vllm.v1.worker.mamba_utils.get_mamba_groups",
+        return_value=([0], spec),
+    ):
+        preprocess_mamba(
+            scheduler_output,
+            MagicMock(),
+            cache_config,
+            {},
+            input_batch,
+            {"req_0": req_state},
+            {},
+            (),
+            MagicMock(offset=0),
+        )
+
+    assert int(input_batch.num_accepted_tokens_cpu[0]) == 1
+
+
+def test_preprocess_mamba_normalizes_placeholder_only_spec_step(monkeypatch):
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    spec = MagicMock(block_size=64, num_speculative_blocks=0)
+    cache_config = MagicMock(enable_prefix_caching=True)
+    input_batch = MagicMock(req_ids=["req_0"], num_accepted_tokens_cpu=[3])
+    req_state = MagicMock(num_computed_tokens=0, block_ids=([0],))
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req_0": 2},
+        total_num_scheduled_tokens=2,
+        scheduled_spec_decode_tokens={"req_0": [-1]},
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[],
         finished_req_ids=set(),
