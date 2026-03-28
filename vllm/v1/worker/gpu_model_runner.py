@@ -1160,11 +1160,8 @@ class GPUModelRunner(
         (
             valid_sampled_token_count,
             valid_sampled_prev_num_draft_len,
-            valid_sampled_req_ids,
+            _valid_sampled_req_ids,
         ) = self._get_valid_sampled_token_count_and_prev_draft_len()
-        sampled_req_id_to_index = {
-            req_id: i for i, req_id in enumerate(valid_sampled_req_ids)
-        }
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -1188,7 +1185,8 @@ class GPUModelRunner(
                 # the spec tokens length, but in third step it contains the
                 # spec tokens length. we only need to update num_computed_tokens
                 # when prev_num_draft_len > 0.
-                prev_req_index = sampled_req_id_to_index.get(req_id)
+                assert self.input_batch.prev_req_id_to_index is not None
+                prev_req_index = self.input_batch.prev_req_id_to_index.get(req_id)
                 if prev_req_index is None:
                     # There is no sampled-count snapshot for this request in
                     # the previous batch (e.g. boundary transition). Skip
@@ -1199,7 +1197,7 @@ class GPUModelRunner(
                             "req_id=%s req_idx=%d prev_count=%d",
                             req_id,
                             i,
-                            len(sampled_req_id_to_index),
+                            len(self.input_batch.prev_req_id_to_index),
                         )
                 elif prev_req_index >= len(
                     valid_sampled_token_count
