@@ -193,6 +193,17 @@ def preprocess_mamba(
         req_state = requests[req_id]
         accepted_cpu = int(input_batch.num_accepted_tokens_cpu[i])
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+        has_real_draft_tokens = any(tok != -1 for tok in spec_tokens)
+        # Boundary transition: current step has no real speculative tokens,
+        # but accepted count may still reflect previous speculative step.
+        if (
+            not has_real_draft_tokens
+            and accepted_cpu > num_scheduled_tokens
+            and num_scheduled_tokens >= 1
+        ):
+            accepted_cpu = num_scheduled_tokens
+            input_batch.num_accepted_tokens_cpu[i] = accepted_cpu
         if accepted_cpu < 1 or accepted_cpu > num_scheduled_tokens:
             msg = (
                 "Invalid num_accepted_tokens before mamba preprocess: "
