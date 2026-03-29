@@ -1579,20 +1579,24 @@ def test_calc_spec_decode_metadata_bonus_indices_at_boundary(
     vocab_size = 4
     width = max(num_draft_tokens) + 1
 
+    # Metadata tensors live on whatever device _calc_spec_decode_metadata
+    # sent them to; keep test tensors on the same device.
+    dev = metadata.cu_num_sampled_tokens.device
+
     # Each row gets a unique distribution (peak at row_idx % vocab_size)
-    all_logits = torch.zeros((total_rows, vocab_size), dtype=torch.float32)
+    all_logits = torch.zeros((total_rows, vocab_size), dtype=torch.float32, device=dev)
     for r in range(total_rows):
         all_logits[r, r % vocab_size] = 10.0
 
     target_logits = (
-        torch.empty((0, vocab_size), dtype=torch.float32)
+        torch.empty((0, vocab_size), dtype=torch.float32, device=dev)
         if len(target_idx) == 0
         else all_logits[metadata.target_logits_indices]
     )
     bonus_logits = all_logits[metadata.bonus_logits_indices]
 
     sampled_token_ids = torch.full(
-        (batch_size, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+        (batch_size, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=dev
     )
     for i, d in enumerate(num_draft_tokens):
         for j in range(d + 1):
