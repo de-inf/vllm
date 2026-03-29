@@ -70,7 +70,10 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
     assert mamba_state_idx == {"keep": 99}
 
 
-def test_preprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
+def test_preprocess_mamba_boundary_with_real_drafts(monkeypatch):
+    """accepted=5 > num_scheduled=2 with real draft tokens is a valid
+    boundary transition (scheduler clamped drafts at max_model_len).
+    Should normalize accepted to 1, not raise."""
     monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
     spec = MagicMock(block_size=64, num_speculative_blocks=0)
     cache_config = MagicMock(enable_prefix_caching=True)
@@ -88,15 +91,9 @@ def test_preprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
         free_encoder_mm_hashes=[],
     )
 
-    with (
-        patch(
-            "vllm.v1.worker.mamba_utils.get_mamba_groups",
-            return_value=([0], spec),
-        ),
-        pytest.raises(
-            AssertionError,
-            match="Invalid num_accepted_tokens before mamba preprocess",
-        ),
+    with patch(
+        "vllm.v1.worker.mamba_utils.get_mamba_groups",
+        return_value=([0], spec),
     ):
         preprocess_mamba(
             scheduler_output,
@@ -109,6 +106,7 @@ def test_preprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
             (),
             MagicMock(offset=0),
         )
+    assert int(input_batch.num_accepted_tokens_cpu[0]) == 1
 
 
 def test_preprocess_mamba_normalizes_boundary_non_spec_step(monkeypatch):
@@ -297,6 +295,7 @@ def test_preprocess_mamba_boundary_uses_original_bias_for_copy(monkeypatch):
     [
         (5, 1, {}, True),
         (5, 2, {"req_0": [-1]}, True),
+        (5, 3, {"req_0": [10, 20]}, True),
         (3, 3, {"req_0": [10, 20]}, False),
         (1, 1, {}, False),
         (1, 3, {"req_0": [10, 20]}, False),
@@ -304,6 +303,7 @@ def test_preprocess_mamba_boundary_uses_original_bias_for_copy(monkeypatch):
     ids=[
         "no_spec_boundary",
         "placeholder_boundary",
+        "real_drafts_boundary",
         "real_drafts_no_boundary",
         "normal_single_token",
         "normal_with_drafts",

@@ -193,20 +193,18 @@ def preprocess_mamba(
         req_state = requests[req_id]
         accepted_cpu = int(input_batch.num_accepted_tokens_cpu[i])
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-        spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
-        has_real_draft_tokens = any(tok != -1 for tok in spec_tokens)
-
-        # Boundary transition: current step has no real speculative tokens,
-        # but the accepted count still reflects the previous speculative
-        # step (e.g. accepted=5 from a full-spec step, now scheduled=1).
+        # Boundary transition: the stale accepted count from the previous
+        # speculative step exceeds the current step's scheduled budget
+        # (e.g. accepted=5 from a full-spec step, now scheduled=2 because
+        # the scheduler clamped to max_model_len).  This can happen with
+        # no drafts, placeholder-only drafts, or even real but fewer
+        # drafts at the boundary.
         # The running Mamba state lives at offset (accepted-1) within the
         # previous block — we must preserve this for the copy so we read
         # from the correct state slot.  After copying, normalize to 1 for
-        # the current (non-spec) step.
+        # the current step.
         is_boundary_transition = (
-            not has_real_draft_tokens
-            and accepted_cpu > num_scheduled_tokens
-            and num_scheduled_tokens >= 1
+            accepted_cpu > num_scheduled_tokens and num_scheduled_tokens >= 1
         )
         copy_bias_accepted = accepted_cpu
         if is_boundary_transition:
