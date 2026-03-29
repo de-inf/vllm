@@ -1327,6 +1327,35 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+        # At the max_model_len boundary, num_accepted_tokens from the
+        # previous step can exceed the current step's num_scheduled.
+        # _build_attention_metadata passes num_accepted_tokens.gpu to
+        # the Mamba kernel for state-slot selection; a stale value makes
+        # the kernel read from the wrong slot.  Clamp the GPU tensor to
+        # the current scheduled budget.  The CPU tensor is left untouched
+        # so preprocess_mamba can still read the original value for
+        # cross-block state copy.
+        if (
+            self.speculative_config
+            and self.model_config.is_hybrid
+            and self.input_batch.num_reqs > 0
+        ):
+            num_reqs = self.input_batch.num_reqs
+            max_accepted = torch.tensor(
+                [
+                    scheduler_output.num_scheduled_tokens.get(req_id, 1)
+                    for req_id in self.input_batch.req_ids
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.num_accepted_tokens.gpu[:num_reqs] = torch.minimum(
+                torch.from_numpy(
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs].copy()
+                ).to(self.device, non_blocking=True),
+                max_accepted,
+            )
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
