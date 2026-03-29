@@ -165,6 +165,7 @@ class RejectionSampler(nn.Module):
         self._check_sampled_row_invariants(
             output_token_ids,
             target_logits.shape[-1],
+            metadata=metadata,
         )
 
         logprobs_tensors = None
@@ -187,6 +188,7 @@ class RejectionSampler(nn.Module):
         self,
         sampled_token_ids: torch.Tensor,
         vocab_size: int,
+        metadata: SpecDecodeMetadata | None = None,
     ) -> None:
         num_reqs = sampled_token_ids.shape[0]
         first_violation: tuple[int, list[int], list[int]] | None = None
@@ -209,10 +211,19 @@ class RejectionSampler(nn.Module):
             return
 
         req_idx, violation_positions, row = first_violation
+        extra = ""
+        if metadata is not None and req_idx < len(metadata.num_draft_tokens):
+            draft_len = metadata.num_draft_tokens[req_idx]
+            draft_row = (
+                metadata.draft_token_ids[req_idx].tolist()
+                if req_idx < metadata.draft_token_ids.shape[0]
+                else []
+            )
+            extra = f" draft_len={draft_len} draft_row={draft_row}"
         msg = (
             "Invalid rejection sampler row: "
             f"req_idx={req_idx} violation_positions={violation_positions[:8]} "
-            f"row={row} vocab_size={vocab_size}"
+            f"row={row} vocab_size={vocab_size}{extra}"
         )
         if _mtp_fail_fast_enabled():
             raise AssertionError(msg)
