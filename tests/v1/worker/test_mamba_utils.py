@@ -363,6 +363,271 @@ def test_preprocess_mamba_boundary_detection(
         )
 
 
+# ---------------------------------------------------------------------------
+# Cross-step simulation tests
+# ---------------------------------------------------------------------------
+
+
+def _run_preprocess_spy(
+    monkeypatch,
+    *,
+    num_computed: int,
+    stale_accepted: int,
+    num_scheduled: int,
+    spec_tokens: dict,
+    block_size: int = 8,
+    num_spec_blocks: int = 2,
+    prev_state_idx: int | None = None,
+):
+    """Helper: run preprocess_mamba with a spy on collect_mamba_copy_meta.
+
+    Returns (copy_calls, final_accepted) where copy_calls is a list of
+    (src_block_idx, dst_block_idx, accept_token_bias) tuples.
+    """
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    spec = MagicMock(block_size=block_size, num_speculative_blocks=num_spec_blocks)
+    cache_config = MagicMock(enable_prefix_caching=True)
+    input_batch = MagicMock(
+        req_ids=["req_0"],
+        num_accepted_tokens_cpu=[stale_accepted],
+    )
+    num_blocks_needed = -(-(num_computed + num_scheduled) // block_size)
+    block_ids = list(range(num_blocks_needed + num_spec_blocks + 8))
+    req_state = MagicMock(num_computed_tokens=num_computed, block_ids=(block_ids,))
+    if prev_state_idx is None:
+        prev_state_idx = (num_computed - 1) // block_size
+    mamba_state_idx: dict[str, int] = {"req_0": prev_state_idx}
+
+    sched = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req_0": num_scheduled},
+        total_num_scheduled_tokens=num_scheduled,
+        scheduled_spec_decode_tokens=spec_tokens,
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    copy_calls: list[tuple] = []
+
+    def spy(cb, kcc, funcs, gids, src, dst, bias, rs, fc):
+        copy_calls.append((src, dst, bias))
+
+    with (
+        patch(
+            "vllm.v1.worker.mamba_utils.get_mamba_groups",
+            return_value=([0], spec),
+        ),
+        patch(
+            "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta",
+            side_effect=spy,
+        ),
+        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
+    ):
+        preprocess_mamba(
+            sched,
+            MagicMock(),
+            cache_config,
+            mamba_state_idx,
+            input_batch,
+            {"req_0": req_state},
+            {},
+            (),
+            MagicMock(offset=0),
+        )
+
+    final_accepted = int(input_batch.num_accepted_tokens_cpu[0])
+    return copy_calls, final_accepted
+
+
+@pytest.mark.parametrize(
+    "prev_accepted,cur_scheduled",
+    [
+        (5, 1),
+        (5, 2),
+        (5, 3),
+        (4, 1),
+        (3, 2),
+        (2, 1),
+    ],
+    ids=[
+        "5→1",
+        "5→2",
+        "5→3",
+        "4→1",
+        "3→2",
+        "2→1",
+    ],
+)
+def test_cross_step_bias_always_uses_original_accepted(
+    monkeypatch, prev_accepted, cur_scheduled
+):
+    """For any (prev_accepted, cur_scheduled) where prev > cur, the copy
+    bias must equal prev_accepted - 1, never cur_scheduled - 1."""
+    copy_calls, final_accepted = _run_preprocess_spy(
+        monkeypatch,
+        num_computed=248,
+        stale_accepted=prev_accepted,
+        num_scheduled=cur_scheduled,
+        spec_tokens={},
+    )
+    assert final_accepted == 1
+    if copy_calls:
+        _, _, bias = copy_calls[0]
+        assert bias == prev_accepted - 1, f"bias={bias}, expected {prev_accepted - 1}"
+
+
+# ---------------------------------------------------------------------------
+# Block-boundary-crossing tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "num_computed",
+    [
+        8 * 30 - 1,  # one token before block boundary (block_size=8)
+        8 * 30,  # exactly on block boundary
+        8 * 30 + 1,  # one token after block boundary
+        8 * 31 - 1,  # next boundary - 1
+    ],
+    ids=["boundary-1", "boundary", "boundary+1", "next_boundary-1"],
+)
+def test_block_boundary_crossing_correct_bias(monkeypatch, num_computed):
+    """Vary num_computed around a block boundary and confirm copy bias
+    always matches the original stale accepted count."""
+    stale_accepted = 5
+    copy_calls, final_accepted = _run_preprocess_spy(
+        monkeypatch,
+        num_computed=num_computed,
+        stale_accepted=stale_accepted,
+        num_scheduled=1,
+        spec_tokens={},
+        block_size=8,
+        num_spec_blocks=2,
+    )
+    assert final_accepted == 1
+    if copy_calls:
+        _, _, bias = copy_calls[0]
+        assert bias == stale_accepted - 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-request batch tests (boundary + non-boundary in same batch)
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_batch_boundary_and_normal(monkeypatch):
+    """Two requests in the same batch: req_0 is at the boundary
+    (accepted=5 > scheduled=1), req_1 is normal (accepted=2 <=
+    scheduled=3).  Verify req_0 gets the correct bias and req_1 is
+    untouched."""
+    monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
+    block_size = 8
+    num_spec_blocks = 2
+    spec = MagicMock(block_size=block_size, num_speculative_blocks=num_spec_blocks)
+    cache_config = MagicMock(enable_prefix_caching=True)
+
+    r0_computed, r0_accepted, r0_scheduled = 248, 5, 1
+    r1_computed, r1_accepted, r1_scheduled = 100, 2, 3
+
+    input_batch = MagicMock(
+        req_ids=["req_0", "req_1"],
+        num_accepted_tokens_cpu=[r0_accepted, r1_accepted],
+    )
+    max_blocks = 40
+    block_ids_0 = list(range(max_blocks))
+    block_ids_1 = list(range(max_blocks, 2 * max_blocks))
+    req_0 = MagicMock(num_computed_tokens=r0_computed, block_ids=(block_ids_0,))
+    req_1 = MagicMock(num_computed_tokens=r1_computed, block_ids=(block_ids_1,))
+
+    prev_idx_0 = (r0_computed - 1) // block_size
+    prev_idx_1 = (r1_computed - 1) // block_size
+    mamba_state_idx = {"req_0": prev_idx_0, "req_1": prev_idx_1}
+
+    sched = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"req_0": r0_scheduled, "req_1": r1_scheduled},
+        total_num_scheduled_tokens=r0_scheduled + r1_scheduled,
+        scheduled_spec_decode_tokens={"req_1": [10, 20]},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    copy_calls: list[tuple] = []
+
+    def spy(cb, kcc, funcs, gids, src, dst, bias, rs, fc):
+        copy_calls.append((src, dst, bias))
+
+    with (
+        patch(
+            "vllm.v1.worker.mamba_utils.get_mamba_groups",
+            return_value=([0], spec),
+        ),
+        patch(
+            "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta",
+            side_effect=spy,
+        ),
+        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
+    ):
+        preprocess_mamba(
+            sched,
+            MagicMock(),
+            cache_config,
+            mamba_state_idx,
+            input_batch,
+            {"req_0": req_0, "req_1": req_1},
+            {},
+            (),
+            MagicMock(offset=0),
+        )
+
+    assert int(input_batch.num_accepted_tokens_cpu[0]) == 1, (
+        "req_0 (boundary) should be normalized to 1"
+    )
+    assert int(input_batch.num_accepted_tokens_cpu[1]) == r1_accepted, (
+        "req_1 (normal) should keep its accepted count"
+    )
+    for src, dst, bias in copy_calls:
+        if src == prev_idx_0:
+            assert bias == r0_accepted - 1, (
+                f"req_0 copy bias={bias}, expected {r0_accepted - 1}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Property-based: bias is NEVER clamped to scheduled - 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prev_accepted,cur_scheduled",
+    [(a, s) for a in range(2, 7) for s in range(1, a)],
+)
+def test_bias_never_equals_clamped_value(monkeypatch, prev_accepted, cur_scheduled):
+    """For every (prev_accepted > cur_scheduled) pair, the copy bias must
+    be prev_accepted - 1, never cur_scheduled - 1 (the old buggy value)."""
+    copy_calls, _ = _run_preprocess_spy(
+        monkeypatch,
+        num_computed=248,
+        stale_accepted=prev_accepted,
+        num_scheduled=cur_scheduled,
+        spec_tokens={},
+    )
+    if copy_calls:
+        _, _, bias = copy_calls[0]
+        assert bias == prev_accepted - 1
+        if prev_accepted != cur_scheduled:
+            assert bias != cur_scheduled - 1, (
+                f"bias={bias} equals the old buggy clamped value "
+                f"(scheduled-1={cur_scheduled - 1})"
+            )
+
+
 def test_postprocess_mamba_rejects_accepted_gt_scheduled(monkeypatch):
     monkeypatch.setenv("VLLM_MTP_FAIL_FAST", "1")
     spec = MagicMock(block_size=64, num_speculative_blocks=0)
