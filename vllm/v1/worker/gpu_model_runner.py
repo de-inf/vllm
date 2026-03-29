@@ -4018,6 +4018,23 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
+            if not input_fits_in_drafter:
+                max_sl = (
+                    spec_decode_common_attn_metadata.max_seq_len
+                    if spec_decode_common_attn_metadata
+                    else -1
+                )
+                logger.warning(
+                    "[DRAFT-DBG] input_fits_in_drafter=False "
+                    "max_seq_len=%d + num_spec=%d = %d > "
+                    "effective_drafter_mml=%d  async=%s",
+                    max_sl,
+                    self.num_spec_tokens,
+                    max_sl + self.num_spec_tokens,
+                    self.effective_drafter_max_model_len,
+                    self.use_async_scheduling,
+                )
+
             use_gpu_toks = (
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
