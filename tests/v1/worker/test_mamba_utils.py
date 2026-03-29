@@ -567,39 +567,28 @@ class TestSameBlockStaleness:
 # =====================================================================
 
 
-class TestPostprocessReceivesStaleAccepted:
-    """When preprocess_mamba doesn't normalize (same block, no copy),
-    the stale num_accepted_tokens_cpu leaks to postprocess_mamba.
-    postprocess_mamba uses it to compute new_num_computed_tokens, which
-    can exceed what's valid."""
+class TestPostprocessWithNormalizedAccepted:
+    """After the preprocess_mamba fix normalizes stale accepted counts,
+    postprocess_mamba receives the current step's accepted count (set
+    by _update_states_after_model_execute). These tests verify
+    postprocess behaves correctly with accepted=1 at the boundary."""
 
-    def test_stale_accepted_causes_wrong_new_computed(self):
-        """If accepted=5 leaks through (should be 1), postprocess_mamba
-        computes new_num_computed = running_state + 5 - 1, which is
-        4 too high."""
+    @staticmethod
+    def _run_postprocess(num_computed, num_scheduled, accepted):
         from vllm.v1.worker.mamba_utils import postprocess_mamba
 
         block_size = 8
         spec = MagicMock(block_size=block_size, num_speculative_blocks=0)
-
-        num_computed = 248
-        num_scheduled = 1
-        stale_accepted = 5  # should be 1
-
         input_batch = MagicMock(
             req_ids=["req_0"],
-            num_accepted_tokens_cpu=[stale_accepted],
+            num_accepted_tokens_cpu=[accepted],
         )
         req = MagicMock(
             num_computed_tokens=num_computed,
             block_ids=(list(range(40)),),
         )
-        prev_state_idx = (num_computed - 1) // block_size
-        state_idx = {"req_0": prev_state_idx}
-
-        sched = _make_sched(
-            num_scheduled={"req_0": num_scheduled},
-        )
+        state_idx = {"req_0": (num_computed - 1) // block_size}
+        sched = _make_sched({"req_0": num_scheduled})
 
         copy_calls: list[tuple] = []
 
@@ -608,10 +597,12 @@ class TestPostprocessReceivesStaleAccepted:
 
         with (
             patch(
-                "vllm.v1.worker.mamba_utils.get_mamba_groups", return_value=([0], spec)
+                "vllm.v1.worker.mamba_utils.get_mamba_groups",
+                return_value=([0], spec),
             ),
             patch(
-                "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta", side_effect=spy
+                "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta",
+                side_effect=spy,
             ),
             patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
         ):
@@ -625,89 +616,21 @@ class TestPostprocessReceivesStaleAccepted:
                 (),
                 MagicMock(offset=0),
             )
+        return copy_calls
 
-        # With stale_accepted=5, num_scheduled=1:
-        # running_state = 248 + 1 - 0 = 249
-        # new_computed = 249 + 5 - 1 = 253  (wrong, should be 249)
-        # aligned = 253 // 8 * 8 = 248
-        # 248 >= 249? NO → no copy, which means no state save.
-        #
-        # With correct accepted=1:
-        # new_computed = 249 + 1 - 1 = 249
-        # aligned = 249 // 8 * 8 = 248
-        # 248 >= 249? NO → no copy (correct for same block).
-        #
-        # With stale_accepted=5 and larger values the bug manifests
-        # as wrong dest_block_idx. Let's test a case that triggers it:
-        pass
-
-    def test_stale_accepted_causes_wrong_dest_block(self):
-        """Stale accepted can push new_num_computed past a block
-        boundary, triggering a copy to the wrong destination block."""
-        from vllm.v1.worker.mamba_utils import postprocess_mamba
-
-        block_size = 8
-        spec = MagicMock(block_size=block_size, num_speculative_blocks=0)
-
-        num_computed = 244
-        num_scheduled = 1
-        stale_accepted = 5  # should be 1
-
-        input_batch = MagicMock(
-            req_ids=["req_0"],
-            num_accepted_tokens_cpu=[stale_accepted],
-        )
-        req = MagicMock(
-            num_computed_tokens=num_computed,
-            block_ids=(list(range(40)),),
-        )
-        prev_state_idx = (num_computed - 1) // block_size  # 30
-        state_idx = {"req_0": prev_state_idx}
-
-        sched = _make_sched(num_scheduled={"req_0": num_scheduled})
-
-        copy_calls: list[tuple] = []
-
-        def spy(cb, kcc, funcs, gids, src, dst, bias, rs, fc):
-            copy_calls.append((src, dst, bias))
-
-        with (
-            patch(
-                "vllm.v1.worker.mamba_utils.get_mamba_groups", return_value=([0], spec)
-            ),
-            patch(
-                "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta", side_effect=spy
-            ),
-            patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
-        ):
-            postprocess_mamba(
-                sched,
-                MagicMock(),
-                input_batch,
-                {"req_0": req},
-                state_idx,
-                {},
-                (),
-                MagicMock(offset=0),
-            )
-
-        # running_state = 244 + 1 - 0 = 245
-        # With accepted=5: new_computed = 245 + 5 - 1 = 249
-        #   aligned = 249 // 8 * 8 = 248
-        #   248 >= 245 → YES → copy triggered!
-        #   dest_block = 248 // 8 - 1 = 30
-        #   bias = 248 - 245 = 3
-        # With accepted=1: new_computed = 245 + 1 - 1 = 245
-        #   aligned = 245 // 8 * 8 = 240
-        #   240 >= 245? NO → no copy (correct)
-        #
-        # The stale value triggers a SPURIOUS copy that shouldn't happen.
-        if stale_accepted == 5:
-            assert len(copy_calls) == 0, (
-                f"Stale accepted={stale_accepted} caused a spurious copy "
-                f"in postprocess: {copy_calls}. With correct accepted=1 "
-                f"no copy should happen."
-            )
+    @pytest.mark.parametrize(
+        "num_computed,num_scheduled",
+        [(244, 1), (248, 1), (250, 1)],
+        ids=["nc244", "nc248", "nc250"],
+    )
+    def test_no_spurious_copy_with_accepted_1(self, num_computed, num_scheduled):
+        """With normalized accepted=1, postprocess should not trigger
+        spurious copies at the boundary."""
+        copy_calls = self._run_postprocess(num_computed, num_scheduled, accepted=1)
+        running = num_computed + num_scheduled
+        aligned = (running // 8) * 8
+        if aligned < running:
+            assert len(copy_calls) == 0, f"Spurious copy with accepted=1: {copy_calls}"
 
 
 # =====================================================================
@@ -870,188 +793,24 @@ class TestUpdateStatesAsyncBookkeeping:
 # =====================================================================
 
 
-class TestPrePostprocessInteraction:
-    """Simulate a full preprocess→postprocess cycle and verify the
-    stale accepted count causes observable wrong behavior in
-    postprocess_mamba."""
+class TestPrePostprocessInteractionFixed:
+    """After the preprocess fix, verify the full cycle works:
+    preprocess normalizes the stale value so postprocess sees
+    accepted=1."""
 
-    def test_stale_preprocess_cascades_to_postprocess_wrong_bias(self):
-        """Simulate: preprocess sees stale accepted=5 (same block, no
-        reset), then postprocess runs with that stale value. The
-        accept_token_bias in postprocess will be wrong."""
-        from vllm.v1.worker.mamba_utils import postprocess_mamba
-
-        block_size = 8
-        num_spec_blocks = 0
-        spec = MagicMock(
-            block_size=block_size,
-            num_speculative_blocks=num_spec_blocks,
+    def test_preprocess_normalizes_before_postprocess(self, monkeypatch):
+        """Preprocess normalizes stale accepted=5 to 1 even in the
+        same-block case, preventing cascade to postprocess."""
+        _, final = _run_preprocess_spy(
+            monkeypatch,
+            num_computed=241,
+            stale_accepted=5,
+            num_scheduled=1,
+            spec_tokens={},
+            block_size=8,
+            num_spec_blocks=0,
         )
-        cache_config = MagicMock(enable_prefix_caching=True)
-
-        # --- preprocess step (same block, no reset) ---
-        num_computed = 241  # (241-1)//8 = 30
-        stale_accepted = 5
-        num_scheduled = 1
-
-        input_batch = MagicMock(
-            req_ids=["req_0"],
-            num_accepted_tokens_cpu=[stale_accepted],
-        )
-        block_ids = list(range(40))
-        req_state = MagicMock(
-            num_computed_tokens=num_computed,
-            block_ids=(block_ids,),
-        )
-        prev_idx = (num_computed - 1) // block_size  # 30
-        state_idx: dict[str, int] = {"req_0": prev_idx}
-
-        sched = _make_sched({"req_0": num_scheduled})
-
-        with (
-            patch(
-                "vllm.v1.worker.mamba_utils.get_mamba_groups",
-                return_value=([0], spec),
-            ),
-            patch("vllm.v1.worker.mamba_utils.collect_mamba_copy_meta"),
-            patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
-        ):
-            preprocess_mamba(
-                sched,
-                MagicMock(),
-                cache_config,
-                state_idx,
-                input_batch,
-                {"req_0": req_state},
-                {},
-                (),
-                MagicMock(offset=0),
-            )
-
-        # On clean branch: preprocess didn't normalize (same block)
-        leaked = int(input_batch.num_accepted_tokens_cpu[0])
-
-        # --- now simulate postprocess with the leaked value ---
-        # _update_states_after_model_execute would set accepted from
-        # current step's output, but if that step only scheduled 1
-        # token, accepted=1. However, on the clean branch there's
-        # no guard. We simulate the scenario where the stale value
-        # survived (which happens when prev==curr in preprocess).
-        post_copy_calls: list[tuple] = []
-
-        def spy(cb, kcc, funcs, gids, src, dst, bias, rs, fc):
-            post_copy_calls.append((src, dst, bias))
-
-        with (
-            patch(
-                "vllm.v1.worker.mamba_utils.get_mamba_groups",
-                return_value=([0], spec),
-            ),
-            patch(
-                "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta",
-                side_effect=spy,
-            ),
-            patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
-        ):
-            postprocess_mamba(
-                sched,
-                MagicMock(),
-                input_batch,
-                {"req_0": req_state},
-                state_idx,
-                {},
-                (),
-                MagicMock(offset=0),
-            )
-
-        # With leaked accepted=5, scheduled=1:
-        #   running_state = 241 + 1 - 0 = 242
-        #   new_computed = 242 + 5 - 1 = 246
-        #   aligned = 246 // 8 * 8 = 240
-        #   240 >= 242? NO → no copy (happens to be benign here)
-        #
-        # With correct accepted=1:
-        #   new_computed = 242 + 1 - 1 = 242
-        #   aligned = 242 // 8 * 8 = 240
-        #   240 >= 242? NO → no copy (same result)
-        #
-        # The leak is detectable because accepted wasn't normalized.
-        assert leaked == 1, (
-            f"Stale accepted={leaked} leaked through preprocess "
-            f"(same block, no reset). Should be 1."
-        )
-
-    @pytest.mark.parametrize(
-        "num_computed,stale_accepted,num_scheduled",
-        [
-            (244, 5, 1),  # running=245, new_computed=249, aligned=248≥245
-            (244, 4, 1),  # running=245, new_computed=248, aligned=248≥245
-            (244, 3, 2),  # running=246, new_computed=248, aligned=248≥246
-        ],
-        ids=["nc244-a5-s1", "nc244-a4-s1", "nc244-a3-s2"],
-    )
-    def test_stale_accepted_triggers_spurious_postprocess_copy(
-        self, num_computed, stale_accepted, num_scheduled
-    ):
-        """When the stale accepted count is large enough, postprocess
-        triggers a copy that shouldn't happen with accepted=1."""
-        from vllm.v1.worker.mamba_utils import postprocess_mamba
-
-        block_size = 8
-        spec = MagicMock(block_size=block_size, num_speculative_blocks=0)
-
-        input_batch = MagicMock(
-            req_ids=["req_0"],
-            num_accepted_tokens_cpu=[stale_accepted],
-        )
-        req = MagicMock(
-            num_computed_tokens=num_computed,
-            block_ids=(list(range(40)),),
-        )
-        state_idx = {"req_0": (num_computed - 1) // block_size}
-        sched = _make_sched({"req_0": num_scheduled})
-
-        copy_calls: list[tuple] = []
-
-        def spy(cb, kcc, funcs, gids, src, dst, bias, rs, fc):
-            copy_calls.append((src, dst, bias))
-
-        with (
-            patch(
-                "vllm.v1.worker.mamba_utils.get_mamba_groups",
-                return_value=([0], spec),
-            ),
-            patch(
-                "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta",
-                side_effect=spy,
-            ),
-            patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
-        ):
-            postprocess_mamba(
-                sched,
-                MagicMock(),
-                input_batch,
-                {"req_0": req},
-                state_idx,
-                {},
-                (),
-                MagicMock(offset=0),
-            )
-
-        # With correct accepted=1, running_state + 1 - 1 = running_state
-        # aligned(running_state) < running_state → no copy.
-        # With stale accepted, running_state + stale - 1 pushes past
-        # block alignment → spurious copy.
-        running = num_computed + num_scheduled
-        correct_new = running + 1 - 1
-        correct_aligned = (correct_new // block_size) * block_size
-        if correct_aligned < running:
-            assert len(copy_calls) == 0, (
-                f"Stale accepted={stale_accepted} triggered spurious "
-                f"postprocess copy: {copy_calls}. "
-                f"With accepted=1, no copy should happen "
-                f"(aligned={correct_aligned} < running={running})."
-            )
+        assert final == 1
 
 
 # =====================================================================
