@@ -174,7 +174,11 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    InputBatch,
+    get_effective_draft_token_count,
+)
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -1945,12 +1949,14 @@ class GPUModelRunner(
                 draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
-                num_draft_tokens[req_idx] = len(draft_token_ids)
+                num_draft_tokens[req_idx] = get_effective_draft_token_count(
+                    draft_token_ids
+                )
                 if (
                     self.input_batch.num_computed_tokens_cpu[req_idx]
                     >= self.input_batch.num_prompt_tokens[req_idx]
                 ):
-                    num_decode_draft_tokens[req_idx] = len(draft_token_ids)
+                    num_decode_draft_tokens[req_idx] = num_draft_tokens[req_idx]
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens
             )
