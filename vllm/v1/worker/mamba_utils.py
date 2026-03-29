@@ -195,16 +195,27 @@ def preprocess_mamba(
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
         has_real_draft_tokens = any(tok != -1 for tok in spec_tokens)
+
         # Boundary transition: current step has no real speculative tokens,
-        # but accepted count may still reflect previous speculative step.
-        if (
+        # but the accepted count still reflects the previous speculative
+        # step (e.g. accepted=5 from a full-spec step, now scheduled=1).
+        # The running Mamba state lives at offset (accepted-1) within the
+        # previous block — we must preserve this for the copy so we read
+        # from the correct state slot.  After copying, normalize to 1 for
+        # the current (non-spec) step.
+        is_boundary_transition = (
             not has_real_draft_tokens
             and accepted_cpu > num_scheduled_tokens
             and num_scheduled_tokens >= 1
-        ):
-            accepted_cpu = num_scheduled_tokens
+        )
+        copy_bias_accepted = accepted_cpu
+        if is_boundary_transition:
+            accepted_cpu = 1
             input_batch.num_accepted_tokens_cpu[i] = accepted_cpu
-        if accepted_cpu < 1 or accepted_cpu > num_scheduled_tokens:
+
+        if not is_boundary_transition and (
+            accepted_cpu < 1 or accepted_cpu > num_scheduled_tokens
+        ):
             msg = (
                 "Invalid num_accepted_tokens before mamba preprocess: "
                 f"req_id={req_id} req_idx={i} accepted={accepted_cpu} "
@@ -241,12 +252,15 @@ def preprocess_mamba(
             logger.warning(
                 "[MTP-DBG preprocess] req_id=%s req_idx=%d "
                 "num_computed=%d num_scheduled=%d num_accepted_cpu=%d "
+                "copy_bias_accepted=%d boundary=%s "
                 "block_size=%d num_spec_blocks=%d prev_state_idx=%d curr_state_idx=%d",
                 req_id,
                 i,
                 req_state.num_computed_tokens,
                 num_scheduled_tokens,
                 int(input_batch.num_accepted_tokens_cpu[i]),
+                copy_bias_accepted,
+                is_boundary_transition,
                 block_size,
                 num_speculative_blocks,
                 prev_state_idx,
@@ -261,7 +275,7 @@ def preprocess_mamba(
                     i,
                     prev_state_idx,
                     curr_state_idx,
-                    int(input_batch.num_accepted_tokens_cpu[i] - 1),
+                    copy_bias_accepted - 1,
                 )
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -270,7 +284,7 @@ def preprocess_mamba(
                 mamba_group_ids,
                 prev_state_idx,
                 curr_state_idx,
-                input_batch.num_accepted_tokens_cpu[i] - 1,
+                copy_bias_accepted - 1,
                 req_state,
                 forward_context,
             )
