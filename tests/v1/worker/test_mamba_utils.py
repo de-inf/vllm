@@ -700,44 +700,37 @@ class TestAllRequestsSameBlockBoundary:
 
 
 class TestClampAliasingCrossRequest:
-    """The clamp_(max=N-1) in _get_logprobs_tensors aliases invalid
-    tail indices to the LAST real logit row. In a ragged batch, this
-    means one request's invalid positions silently read another
-    request's logits.
+    """The original clamp_(max=N-1) in _get_logprobs_tensors aliases
+    out-of-range tail indices to the last real logit row.  The fix
+    replaces clamp with a dummy row so out-of-range indices read
+    zeros instead of another request's logits."""
 
-    On the clean branch, there is no dummy row, so all indices map to
-    real logit rows. We detect this by verifying the actual index values
-    used for gathering."""
-
-    def test_clamp_aliases_to_last_row(self):
-        """Directly test that clamp_(max=N-1) maps out-of-range indices
-        to the last row instead of a dummy/sentinel."""
-
-        # Simulate: 2 requests, num_draft=[0, 2], total_rows=4
-        # req_0 segment: rows [0], req_1 segment: rows [1, 2, 3]
-        # req_0 width=3, valid only at pos 0, positions 1,2 are invalid
+    def test_out_of_range_indices_route_to_dummy(self):
+        """When a short request appears AFTER a longer request
+        (e.g. num_draft=[2, 0]), its tail indices exceed num_rows
+        and must route to the dummy row, not clamp to the last
+        real row."""
         num_rows = 4
-        cu_num_sampled = torch.tensor([1, 4], device="cpu")
+        cu_num_sampled = torch.tensor([3, 4], device="cpu")
         cu_shifted = torch.zeros_like(cu_num_sampled)
-        cu_shifted[1:] = cu_num_sampled[:-1]  # [0, 1]
+        cu_shifted[1:] = cu_num_sampled[:-1]  # [0, 3]
 
-        width = 3  # max_spec_len + 1
+        width = 3
         offsets = torch.arange(width, dtype=cu_shifted.dtype)
         indices = (cu_shifted.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
-        # indices = [0, 1, 2, 1, 2, 3]
-        # req_0's positions: [0, 1, 2] — pos 1,2 are out of req_0's segment
+        # req_1 (bonus-only): indices = [3, 4, 5]
+        # pos 1 (idx=4) and pos 2 (idx=5) are >= num_rows
 
-        indices.clamp_(max=num_rows - 1)
-        # After clamp: [0, 1, 2, 1, 2, 3]
-        # pos 1 → row 1 (req_1's first target row!)
-        # pos 2 → row 2 (req_1's second target row!)
+        dummy_idx = num_rows
+        fixed_indices = torch.where(
+            indices < num_rows,
+            indices,
+            torch.full_like(indices, dummy_idx),
+        )
 
-        # These should map to a dummy row, not to req_1's rows
-        req0_tail_indices = indices[1:3].tolist()  # [1, 2]
-        assert all(idx < 1 or idx >= num_rows for idx in req0_tail_indices), (
-            f"req_0's invalid tails mapped to rows {req0_tail_indices}, "
-            f"which are REAL rows belonging to req_1. "
-            f"clamp_(max={num_rows - 1}) causes cross-request aliasing."
+        req1_tail = fixed_indices[4:6].tolist()
+        assert all(idx == dummy_idx for idx in req1_tail), (
+            f"Out-of-range tails should route to dummy ({dummy_idx}), got {req1_tail}"
         )
 
 

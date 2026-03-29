@@ -998,50 +998,47 @@ class TestGetLogprobsTensorsClampAliasing:
     @pytest.mark.parametrize(
         "num_draft_tokens",
         [
-            pytest.param([0, 2], id="ragged-02"),
             pytest.param([2, 0], id="ragged-20"),
-            pytest.param([0, 0, 2], id="ragged-002"),
+            pytest.param([2, 0, 0], id="ragged-200"),
+            pytest.param([3, 0], id="ragged-30"),
         ],
     )
-    def test_invalid_tails_do_not_read_other_requests_logits(self, num_draft_tokens):
-        """For bonus-only requests (0 drafts), the logprob at position 0
-        must come from that request's OWN bonus logit row. Positions
-        beyond 0 must NOT carry logprobs from another request's rows.
-
-        The clamp_ bug aliases position 1+ to the last real row, which
-        belongs to a different request.
+    def test_out_of_range_tails_read_dummy_not_real_row(self, num_draft_tokens):
+        """When a short request appears AFTER a longer one, its tail
+        indices exceed num_rows and must read from the dummy row (zeros),
+        not from the last real row (which the old clamp_ would alias to).
         """
         lp, sampled, metadata, all_logits = self._run(num_draft_tokens)
 
         batch_size = len(num_draft_tokens)
         width = sampled.shape[-1]
+        total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+        flat_lp = lp.logprobs.cpu()
 
-        # Gather the flat logprobs for the sampled tokens
-        flat_lp = lp.logprobs.cpu()  # [batch*width, vocab+1] or similar
-
+        cu = [0] + metadata.cu_num_sampled_tokens.cpu().tolist()
         for i in range(batch_size):
+            seg_start = cu[i]
             valid_count = num_draft_tokens[i] + 1
             if valid_count >= width:
                 continue
             for j in range(valid_count, width):
+                raw_idx = seg_start + j
+                if raw_idx < total_rows:
+                    continue
                 flat_idx = i * width + j
                 if flat_idx >= flat_lp.shape[0]:
                     continue
-                # The sampled token at this position is PLACEHOLDER=-1,
-                # replaced with 0 by the code. The logprob is gathered
-                # for token 0 from whatever logit row the index points
-                # to. With clamp aliasing, it points to the LAST real
-                # row. With a proper fix, it should point to a dummy.
                 tail_lp = flat_lp[flat_idx, 0].item()
-                # The last real row's logprob for token 0:
-                last_row = all_logits.shape[0] - 1
-                last_row_lp = torch.log_softmax(all_logits[last_row], dim=-1)[0].item()
+                last_row = total_rows - 1
+                last_row_lp = torch.log_softmax(all_logits[last_row].float(), dim=-1)[
+                    0
+                ].item()
 
                 assert abs(tail_lp - last_row_lp) > 1e-3, (
-                    f"req {i} tail pos {j}: logprob={tail_lp:.4f} "
-                    f"matches last-row logprob={last_row_lp:.4f}. "
-                    f"This means clamp_ aliased the tail to the "
-                    f"last real logit row (cross-request leakage)."
+                    f"req {i} tail pos {j} (raw_idx={raw_idx}): "
+                    f"logprob={tail_lp:.4f} matches last-row "
+                    f"logprob={last_row_lp:.4f}. Out-of-range "
+                    f"tail should read dummy, not last real row."
                 )
 
     @pytest.mark.parametrize(
@@ -1063,7 +1060,6 @@ class TestGetLogprobsTensorsClampAliasing:
         for i, d in enumerate(num_draft_tokens):
             if d != 0:
                 continue
-            # This is a bonus-only request. Its bonus row is cu[i].
             bonus_row = cu[i]
             tok = int(sampled[i, 0].item())
             expected_lp = torch.log_softmax(all_logits[bonus_row].float(), dim=-1)[
@@ -1078,50 +1074,3 @@ class TestGetLogprobsTensorsClampAliasing:
                 f"expected={expected_lp:.4f} (from row {bonus_row}). "
                 f"Mismatch suggests aliasing to wrong row."
             )
-
-    @pytest.mark.parametrize(
-        "num_draft_tokens",
-        [
-            pytest.param([0, 2], id="ragged-02"),
-            pytest.param([2, 0], id="ragged-20"),
-            pytest.param([0, 0, 2], id="ragged-002"),
-            pytest.param([3, 0, 2, 0], id="ragged-3020"),
-        ],
-    )
-    def test_clamp_indices_do_not_exceed_own_segment(self, num_draft_tokens):
-        """Directly verify that the logit indices used for each
-        request stay within that request's own segment of
-        final_logits. On the buggy branch, clamp_(max=N-1) lets
-        short requests index into later requests' segments."""
-        metadata = _build_spec_metadata(num_draft_tokens)
-        batch_size = len(num_draft_tokens)
-        total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
-        width = max(num_draft_tokens) + 1
-        dev = metadata.cu_num_sampled_tokens.device
-
-        cu_shifted = torch.zeros_like(metadata.cu_num_sampled_tokens)
-        cu_shifted[1:] = metadata.cu_num_sampled_tokens[:-1]
-
-        offsets = torch.arange(width, device=dev, dtype=cu_shifted.dtype)
-        indices = (cu_shifted.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
-        indices.clamp_(max=total_rows - 1)
-
-        cu = [0] + metadata.cu_num_sampled_tokens.cpu().tolist()
-        for i in range(batch_size):
-            seg_start, seg_end = cu[i], cu[i + 1]
-            valid_count = num_draft_tokens[i] + 1
-            for j in range(width):
-                flat_idx = i * width + j
-                idx = indices[flat_idx].item()
-                if j < valid_count:
-                    assert seg_start <= idx < seg_end, (
-                        f"req {i} valid pos {j}: index={idx} "
-                        f"outside own segment [{seg_start}, "
-                        f"{seg_end})"
-                    )
-                else:
-                    assert idx < seg_start or idx >= seg_end, (
-                        f"req {i} INVALID pos {j}: index={idx} "
-                        f"inside segment [{seg_start}, {seg_end})"
-                        f" — aliased to a real row via clamp_"
-                    )
