@@ -184,21 +184,37 @@ class RejectionSampler(nn.Module):
         final_logits[target_logits_indices] = target_logits.to(torch.float32)
         final_logits[bonus_logits_indices] = bonus_logits.to(torch.float32)
 
-        # NOTE: To avoid cpu-gpu synchronization, we now simply compute indices for
-        # all draft tokens, including the rejected ones. The rejected tokens will
-        # be filtered out in the `parse_output`.
         logit_start_indices = cu_num_sampled_tokens
         offsets = torch.arange(
             sampled_token_ids.shape[-1],
             device=logit_start_indices.device,
             dtype=logit_start_indices.dtype,
         )
-        accepted_logit_indices = (
+        all_logit_indices = (
             logit_start_indices.unsqueeze(1) + offsets.unsqueeze(0)
         ).flatten()
-        accepted_logit_indices.clamp_(max=final_logits.shape[0] - 1)
+
+        num_rows = final_logits.shape[0]
+
+        # Append a dummy row so out-of-range indices never alias to a
+        # real logit row from another request.
+        dummy_logits = torch.zeros(
+            (1, final_logits.shape[1]),
+            dtype=final_logits.dtype,
+            device=final_logits.device,
+        )
+        final_logits = torch.cat([final_logits, dummy_logits], dim=0)
+        dummy_idx = num_rows
+
+        # Route invalid indices to the dummy row instead of clamping
+        # to the last real row (which would alias across requests).
+        accepted_logit_indices = torch.where(
+            all_logit_indices < num_rows,
+            all_logit_indices,
+            torch.full_like(all_logit_indices, dummy_idx),
+        )
+
         accepted_tokens = sampled_token_ids.clone().flatten()
-        # we replace rejected token ids with 0 to avoid gather_logprobs error
         accepted_tokens[accepted_tokens == PLACEHOLDER_TOKEN_ID] = 0
 
         # Compute logprobs for accepted tokens.

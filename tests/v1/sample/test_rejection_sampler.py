@@ -933,3 +933,174 @@ def test_sample_recovered_tokens(
         device=DEVICE_TYPE,
     )
     assert torch.equal(recovered_token_ids, ref_recovered_token_ids)
+
+
+# =====================================================================
+# Bug A: _get_logprobs_tensors clamp aliasing
+# =====================================================================
+# The original code uses clamp_(max=final_logits.shape[0] - 1) on
+# logit indices, which silently aliases invalid tail positions to the
+# last real logit row.  In a ragged batch this lets one request's
+# invalid tails read another request's logits — cross-request leakage.
+
+
+def _build_spec_metadata(num_draft_tokens: list[int]):
+    """Build SpecDecodeMetadata on CPU for a given ragged batch."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    num_draft_np = np.array(num_draft_tokens, dtype=np.int32)
+    num_sampled = num_draft_np + 1
+    cu = np.cumsum(num_sampled).astype(np.int32)
+    max_idx = int(cu[-1])
+
+    fake = SimpleNamespace(
+        device=torch.device(DEVICE_TYPE),
+        arange_np=np.arange(max_idx + 1, dtype=np.int32),
+        input_ids=SimpleNamespace(
+            gpu=torch.arange(max_idx + 1, dtype=torch.int32, device=DEVICE_TYPE)
+        ),
+    )
+    fake._get_cumsum_and_arange = GPUModelRunner._get_cumsum_and_arange.__get__(
+        fake, type(fake)
+    )
+    return GPUModelRunner._calc_spec_decode_metadata(fake, num_draft_np, cu)
+
+
+class TestGetLogprobsTensorsClampAliasing:
+    """Tests that _get_logprobs_tensors does NOT let invalid tail
+    positions alias to real logit rows from other requests."""
+
+    @staticmethod
+    def _run(num_draft_tokens: list[int], vocab_size: int = 8):
+        """Run _get_logprobs_tensors and return per-request logprob
+        values for each position (valid and invalid)."""
+        metadata = _build_spec_metadata(num_draft_tokens)
+        batch_size = len(num_draft_tokens)
+        total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+        width = max(num_draft_tokens) + 1
+        dev = metadata.cu_num_sampled_tokens.device
+
+        # Each row gets a UNIQUE logit pattern: row r peaks at
+        # token (r % vocab_size) with value 10.0.
+        all_logits = torch.zeros(
+            (total_rows, vocab_size), dtype=torch.float32, device=dev
+        )
+        for r in range(total_rows):
+            all_logits[r, r % vocab_size] = 10.0
+
+        target_idx = metadata.target_logits_indices
+        bonus_idx = metadata.bonus_logits_indices
+        target_logits = (
+            torch.empty((0, vocab_size), dtype=torch.float32, device=dev)
+            if target_idx.numel() == 0
+            else all_logits[target_idx]
+        )
+        bonus_logits = all_logits[bonus_idx]
+
+        cu = [0] + metadata.cu_num_sampled_tokens.cpu().tolist()
+        sampled = torch.full(
+            (batch_size, width),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=dev,
+        )
+        for i, d in enumerate(num_draft_tokens):
+            for j in range(d + 1):
+                row = cu[i] + j
+                sampled[i, j] = row % vocab_size
+
+        sampler = Sampler(logprobs_mode="raw_logprobs")
+        rej = RejectionSampler(sampler)
+        lp = rej._get_logprobs_tensors(
+            max_num_logprobs=0,
+            metadata=metadata,
+            logits=all_logits,
+            target_logits=target_logits,
+            bonus_logits=bonus_logits,
+            sampled_token_ids=sampled,
+        )
+        return lp, sampled, metadata, all_logits
+
+    @pytest.mark.parametrize(
+        "num_draft_tokens",
+        [
+            pytest.param([2, 0], id="ragged-20"),
+            pytest.param([2, 0, 0], id="ragged-200"),
+            pytest.param([3, 0], id="ragged-30"),
+        ],
+    )
+    def test_out_of_range_tails_read_dummy_not_real_row(self, num_draft_tokens):
+        """When a short request appears AFTER a longer one, its tail
+        indices exceed num_rows and must read from the dummy row (zeros),
+        not from the last real row (which the old clamp_ would alias to).
+        """
+        lp, sampled, metadata, all_logits = self._run(num_draft_tokens)
+
+        batch_size = len(num_draft_tokens)
+        width = sampled.shape[-1]
+        total_rows = int(metadata.cu_num_sampled_tokens[-1].item())
+        flat_lp = lp.logprobs.cpu()
+
+        cu = [0] + metadata.cu_num_sampled_tokens.cpu().tolist()
+        for i in range(batch_size):
+            seg_start = cu[i]
+            valid_count = num_draft_tokens[i] + 1
+            if valid_count >= width:
+                continue
+            for j in range(valid_count, width):
+                raw_idx = seg_start + j
+                if raw_idx < total_rows:
+                    continue
+                flat_idx = i * width + j
+                if flat_idx >= flat_lp.shape[0]:
+                    continue
+                tail_lp = flat_lp[flat_idx, 0].item()
+                last_row = total_rows - 1
+                last_row_lp = torch.log_softmax(all_logits[last_row].float(), dim=-1)[
+                    0
+                ].item()
+
+                assert abs(tail_lp - last_row_lp) > 1e-3, (
+                    f"req {i} tail pos {j} (raw_idx={raw_idx}): "
+                    f"logprob={tail_lp:.4f} matches last-row "
+                    f"logprob={last_row_lp:.4f}. Out-of-range "
+                    f"tail should read dummy, not last real row."
+                )
+
+    @pytest.mark.parametrize(
+        "num_draft_tokens",
+        [
+            pytest.param([0, 2], id="ragged-02"),
+            pytest.param([2, 0], id="ragged-20"),
+        ],
+    )
+    def test_bonus_only_logprob_comes_from_own_row(self, num_draft_tokens):
+        """A bonus-only request's logprob at position 0 must come from
+        its own bonus logit row, not from some other request."""
+        lp, sampled, metadata, all_logits = self._run(num_draft_tokens)
+
+        cu = [0] + metadata.cu_num_sampled_tokens.cpu().tolist()
+        width = sampled.shape[-1]
+        flat_lp = lp.logprobs.cpu()
+
+        for i, d in enumerate(num_draft_tokens):
+            if d != 0:
+                continue
+            bonus_row = cu[i]
+            tok = int(sampled[i, 0].item())
+            expected_lp = torch.log_softmax(all_logits[bonus_row].float(), dim=-1)[
+                tok
+            ].item()
+
+            flat_idx = i * width
+            actual_lp = flat_lp[flat_idx, 0].item()
+
+            assert abs(actual_lp - expected_lp) < 1e-3, (
+                f"req {i} (bonus-only): logprob={actual_lp:.4f} "
+                f"expected={expected_lp:.4f} (from row {bonus_row}). "
+                f"Mismatch suggests aliasing to wrong row."
+            )
