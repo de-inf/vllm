@@ -181,6 +181,17 @@ def preprocess_mamba(
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+
+        # At the max_model_len boundary the stale accepted count from
+        # the previous speculative step can exceed the current step's
+        # scheduled budget.  Normalize it to 1 so downstream consumers
+        # (postprocess_mamba, the Mamba attention kernel) don't use the
+        # stale value.  The copy below still reads the original value
+        # for the correct accept_token_bias.
+        accepted_cpu = int(input_batch.num_accepted_tokens_cpu[i])
+        if accepted_cpu > num_scheduled_tokens and num_scheduled_tokens >= 1:
+            input_batch.num_accepted_tokens_cpu[i] = 1
+
         num_blocks: int = (
             cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
             + num_speculative_blocks
@@ -206,7 +217,7 @@ def preprocess_mamba(
                 mamba_group_ids,
                 prev_state_idx,
                 curr_state_idx,
-                input_batch.num_accepted_tokens_cpu[i] - 1,
+                accepted_cpu - 1,
                 req_state,
                 forward_context,
             )
