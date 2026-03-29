@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -25,16 +24,6 @@ from vllm.v1.sample.logits_processor import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
-
-PLACEHOLDER_TOKEN_ID = -1
-
-
-def get_effective_draft_token_count(spec_token_ids: Sequence[int]) -> int:
-    """Return contiguous non-placeholder draft prefix length."""
-    for i, token_id in enumerate(spec_token_ids):
-        if token_id == PLACEHOLDER_TOKEN_ID:
-            return i
-    return len(spec_token_ids)
 
 
 @dataclass
@@ -463,9 +452,8 @@ class InputBatch:
         # scheduler_output.scheduled_spec_decode_tokens being empty,
         # even when speculative decoding is enabled.
         cur_spec_token_ids.clear()
-        raw_spec_token_ids = scheduled_spec_tokens.get(req_id, ())
-        num_spec_tokens = get_effective_draft_token_count(raw_spec_token_ids)
-        spec_token_ids = raw_spec_token_ids[:num_spec_tokens]
+        spec_token_ids = scheduled_spec_tokens.get(req_id, ())
+        num_spec_tokens = len(spec_token_ids)
         request.prev_num_draft_len = num_spec_tokens
         if not spec_token_ids:
             return

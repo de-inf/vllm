@@ -38,10 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.worker.gpu_input_batch import (
-    InputBatch,
-    get_effective_draft_token_count,
-)
+from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
@@ -596,57 +593,6 @@ def test_update_states_async_missing_prev_req_mapping_skips_adjustment(
     model_runner._update_states(scheduler_output)
     # Adjustment is skipped when no previous-index mapping exists.
     assert model_runner.requests[req_id].num_computed_tokens == 100
-
-
-@pytest.mark.parametrize(
-    "draft_tokens,expected",
-    [
-        pytest.param([], 0, id="empty"),
-        pytest.param([-1], 0, id="placeholder-only"),
-        pytest.param([17, -1], 1, id="single-real-then-placeholder"),
-        pytest.param([17, 19], 2, id="all-real"),
-        pytest.param([17, -1, 19], 1, id="sparse-tail-ignored"),
-    ],
-)
-def test_get_effective_draft_token_count(
-    draft_tokens: list[int], expected: int
-) -> None:
-    assert get_effective_draft_token_count(draft_tokens) == expected
-
-
-def test_update_states_placeholder_only_spec_tokens_set_zero_prev_draft_len(
-    model_runner, dist_init
-):
-    req_id = "req_0"
-    model_runner._update_states(_schedule_new_request(req_id))
-
-    cached_req_data = CachedRequestData(
-        req_ids=[req_id],
-        resumed_req_ids=set(),
-        new_token_ids=[[]],
-        all_token_ids={},
-        new_block_ids=[None],
-        num_computed_tokens=[100],
-        num_output_tokens=[0],
-    )
-    scheduler_output = SchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=cached_req_data,
-        num_scheduled_tokens={req_id: 2},
-        total_num_scheduled_tokens=2,
-        scheduled_spec_decode_tokens={req_id: [-1]},
-        scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
-        finished_req_ids=set(),
-        free_encoder_mm_hashes=[],
-    )
-
-    model_runner._update_states(scheduler_output)
-
-    req_state = model_runner.requests[req_id]
-    req_idx = model_runner.input_batch.req_id_to_index[req_id]
-    assert req_state.prev_num_draft_len == 0
-    assert model_runner.input_batch.spec_token_ids[req_idx] == []
 
 
 def test_kv_cache_stride_order(monkeypatch, model_runner):
