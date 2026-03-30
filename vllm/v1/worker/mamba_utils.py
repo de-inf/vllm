@@ -187,41 +187,41 @@ def preprocess_mamba(
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
 
-        # At the max_model_len boundary the stale accepted count from
-        # the previous speculative step can exceed the current step's
-        # scheduled budget.  Normalize it to 1 so downstream consumers
-        # (postprocess_mamba, the Mamba attention kernel) don't use the
-        # stale value.  The copy below still reads the original value
-        # for the correct accept_token_bias.
         accepted_cpu = int(input_batch.num_accepted_tokens_cpu[i])
-        if accepted_cpu > num_scheduled_tokens and num_scheduled_tokens >= 1:
-            input_batch.num_accepted_tokens_cpu[i] = 1
+        needs_boundary_norm = (
+            accepted_cpu > num_scheduled_tokens and num_scheduled_tokens >= 1
+        )
 
         num_blocks: int = (
             cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
             + num_speculative_blocks
         )
 
-        # We always save the current running state at the last
-        # (1 + num_speculative_blocks) block.
-        # A corner case worth mention here: assume we have block_size = 4 and
-        # num_speculative_tokens = 2. The request is [A, B, C] and contains 2 draft
-        # tokens [draft 1, draft 2]. Then we will have:
-        # Block 0: [A, B, C, draft 1]
-        # Block 1: [draft 2, TOFILL, TOFILL, TOFILL]
-        # Block 2: speculative block
-        # Block 3: speculative block
-        # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
-        do_copy = prev_state_idx != -1 and prev_state_idx != curr_state_idx
+        cross_block_copy = prev_state_idx != -1 and prev_state_idx != curr_state_idx
+        # When the drafter is skipped near max_model_len, the stale
+        # accepted count from the previous spec-decode step exceeds
+        # the current step's scheduled budget.  We must copy the
+        # Mamba state from slot (accepted - 1) to slot 0 so that
+        # the kernel reads the correct recurrent state.  This copy
+        # is needed even when prev == curr (same block), because
+        # the kernel will be told num_accepted=1 (init_token_idx=0).
+        same_block_boundary_copy = (
+            needs_boundary_norm
+            and not cross_block_copy
+            and prev_state_idx != -1
+            and accepted_cpu > 1
+        )
+        do_copy = cross_block_copy or same_block_boundary_copy
         if _MAMBA_DEBUG:
             block_ids_str = ""
             for gid in mamba_group_ids:
                 block_ids_str = str(req_state.block_ids[gid][:num_blocks])
             logger.warning(
                 "[PRE-MAMBA] req=%s i=%d nc=%d ns=%d accepted=%d "
-                "prev_idx=%d curr_idx=%d do_copy=%s bias=%d "
+                "prev_idx=%d curr_idx=%d do_copy=%s "
+                "cross=%s same_block_boundary=%s bias=%d "
                 "blocks=%s",
                 req_id,
                 i,
@@ -231,6 +231,8 @@ def preprocess_mamba(
                 prev_state_idx,
                 curr_state_idx,
                 do_copy,
+                cross_block_copy,
+                same_block_boundary_copy,
                 accepted_cpu - 1,
                 block_ids_str,
             )
@@ -246,6 +248,8 @@ def preprocess_mamba(
                 req_state,
                 forward_context,
             )
+            input_batch.num_accepted_tokens_cpu[i] = 1
+        elif needs_boundary_norm:
             input_batch.num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(copy_bufs)
 
