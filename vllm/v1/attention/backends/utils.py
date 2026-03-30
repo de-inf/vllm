@@ -863,4 +863,32 @@ def mamba_get_block_table_tensor(
             dtype=torch.int32,
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
-        return torch.gather(block_table, 1, indices_to_gather)
+        result = torch.gather(block_table, 1, indices_to_gather)
+
+        import os
+
+        if os.environ.get("VLLM_MAMBA_BLOCK_TABLE_DEBUG"):
+            num_real = int((seq_lens > 0).sum().item())
+            real_result = result[:num_real]
+            has_null = bool((real_result == -1).any().item())
+            has_zero = bool((real_result == 0).any().item())
+            if has_null or has_zero:
+                for i in range(num_real):
+                    row = real_result[i].tolist()
+                    sl = int(seq_lens[i].item())
+                    si = int(start_indices[i].item())
+                    logger.warning(
+                        "[MAMBA-BT-DBG] NULL BLOCK IDS DETECTED "
+                        "req=%d seq_len=%d start_idx=%d "
+                        "gathered_ids=%s has_null=%s has_zero=%s "
+                        "bt_shape=%s",
+                        i,
+                        sl,
+                        si,
+                        row,
+                        has_null,
+                        has_zero,
+                        list(block_table.shape),
+                    )
+
+        return result
