@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
 )
@@ -18,6 +20,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
+_MAMBA_DEBUG = os.getenv("VLLM_MAMBA_STATE_DEBUG")
 
 
 @triton.jit
@@ -209,7 +214,27 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
-        if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+        do_copy = prev_state_idx != -1 and prev_state_idx != curr_state_idx
+        if _MAMBA_DEBUG:
+            block_ids_str = ""
+            for gid in mamba_group_ids:
+                block_ids_str = str(req_state.block_ids[gid][:num_blocks])
+            logger.warning(
+                "[PRE-MAMBA] req=%s i=%d nc=%d ns=%d accepted=%d "
+                "prev_idx=%d curr_idx=%d do_copy=%s bias=%d "
+                "blocks=%s",
+                req_id,
+                i,
+                req_state.num_computed_tokens,
+                num_scheduled_tokens,
+                accepted_cpu,
+                prev_state_idx,
+                curr_state_idx,
+                do_copy,
+                accepted_cpu - 1,
+                block_ids_str,
+            )
+        if do_copy:
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
@@ -258,11 +283,38 @@ def postprocess_mamba(
         aligned_new_computed_tokens = (
             new_num_computed_tokens // mamba_spec.block_size * mamba_spec.block_size
         )
-        # TODO: how to ensure all blocks that cache_blocks called are cached here?
-        if aligned_new_computed_tokens >= num_tokens_running_state:
+        do_post_copy = aligned_new_computed_tokens >= num_tokens_running_state
+        if _MAMBA_DEBUG:
+            logger.warning(
+                "[POST-MAMBA] req=%s i=%d nc=%d ns=%d nd=%d "
+                "accepted=%d running_state=%d new_computed=%d "
+                "aligned=%d do_copy=%s state_idx=%s",
+                req_id,
+                i,
+                num_computed_tokens,
+                num_scheduled_tokens,
+                num_draft_tokens,
+                num_accepted_tokens,
+                num_tokens_running_state,
+                new_num_computed_tokens,
+                aligned_new_computed_tokens,
+                do_post_copy,
+                mamba_state_idx.get(req_id, "N/A"),
+            )
+        if do_post_copy:
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
             src_block_idx = mamba_state_idx[req_id]
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
+            if _MAMBA_DEBUG:
+                logger.warning(
+                    "[POST-MAMBA COPY] req=%s src_idx=%d dest_idx=%d "
+                    "bias=%d same_block=%s",
+                    req_id,
+                    src_block_idx,
+                    dest_block_idx,
+                    accept_token_bias,
+                    src_block_idx == dest_block_idx,
+                )
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
