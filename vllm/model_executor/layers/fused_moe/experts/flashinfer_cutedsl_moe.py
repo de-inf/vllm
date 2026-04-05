@@ -20,9 +20,188 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
+    autotune,
     flashinfer_cute_dsl_fused_moe_nvfp4,
     has_flashinfer_cutedsl_moe_nvfp4,
 )
+
+
+class FlashInferCuteDSLStandardExperts(mk.FusedMoEExpertsModular):
+    """
+    Standard-format CuTe DSL experts path that directly calls FlashInfer's
+    high-level standard-format NVFP4 MoE API.
+    """
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(moe_config=moe_config, quant_config=quant_config)
+        assert quant_config.quant_dtype == "nvfp4", (
+            "Only nvfp4 quantization are currently supported."
+        )
+        self.out_dtype = moe_config.in_dtype
+        self.local_num_experts = moe_config.num_local_experts
+        self.local_expert_offset = (
+            moe_config.moe_parallel_config.ep_rank * moe_config.num_local_experts
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
+        layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        # Quantize locally so we can use the exact input scale layout expected
+        # by FlashInfer's standard-format CuTe DSL API.
+        return True
+
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        p = current_platform
+        return (
+            p.is_cuda()
+            and p.is_device_capability_family(100)
+            and has_flashinfer_cutedsl_moe_nvfp4()
+        )
+
+    @staticmethod
+    def _supports_no_act_and_mul() -> bool:
+        return False
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) in [(kNvfp4Static, kNvfp4Dynamic)]
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation == MoEActivation.SILU
+
+    @staticmethod
+    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        return True
+
+    def supports_expert_map(self) -> bool:
+        return False
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return TopKWeightAndReduceNoOP()
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        del (
+            N,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+        return (0,), (0,), (M, K)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor | None,
+        workspace2: torch.Tensor | None,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool | None,
+    ):
+        del expert_map, a1q_scale, a2_scale, workspace13, workspace2, expert_tokens_meta
+        del apply_router_weight_on_input
+
+        assert activation == MoEActivation.SILU
+        assert self.quant_config.a1_gscale is not None
+        assert self.quant_config.a2_gscale is not None
+        assert self.g1_alphas is not None
+        assert self.g2_alphas is not None
+        assert self.w1_scale is not None and self.w2_scale is not None
+
+        from flashinfer.fp4_quantization import fp4_quantize
+
+        x_q, x_sf = fp4_quantize(
+            hidden_states,
+            global_scale=self.quant_config.a1_gscale,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=False,
+        )
+        if x_sf.dim() == 2:
+            x_sf = x_sf.unsqueeze(-1)
+
+        if self.w1_scale.dim() != 6 or self.w2_scale.dim() != 6:
+            raise ValueError(
+                "FlashInferCuteDSLStandardExperts expects 6D MMA-format scale tensors "
+                f"after preprocessing, got w1_scale.shape={tuple(self.w1_scale.shape)} "
+                f"and w2_scale.shape={tuple(self.w2_scale.shape)}"
+            )
+
+        # FlashInfer's standard CuTe DSL API expects per-expert GEMM alphas and
+        # a scalar FC2 input scale. vLLM stores the FC2 input scale per expert,
+        # but the preprocessing step expands the same scalar value to all
+        # experts, so collapse it back here before calling FlashInfer.
+        if not torch.allclose(
+            self.a2_gscale, self.a2_gscale[:1].expand_as(self.a2_gscale)
+        ):
+            raise ValueError(
+                "FlashInferCuteDSLStandardExperts expects a single FC2 input "
+                "scale shared by all experts, but got non-uniform a2_gscale"
+            )
+        fc2_input_scale = self.a2_gscale[:1].to(
+            dtype=torch.float32, device=hidden_states.device
+        )
+
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        with autotune(False):
+            result = cute_dsl_fused_moe_nvfp4(
+                x=x_q,
+                x_sf=x_sf,
+                token_selected_experts=topk_ids.to(torch.int32),
+                token_final_scales=topk_weights.to(torch.float32),
+                w1_weight=w1,
+                w1_weight_sf=self.w1_scale,
+                w1_alpha=self.g1_alphas.to(torch.float32),
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2,
+                w2_weight_sf=self.w2_scale,
+                w2_alpha=self.g2_alphas.to(torch.float32),
+                num_experts=global_num_experts,
+                top_k=topk_ids.shape[1],
+                num_local_experts=self.local_num_experts,
+                local_expert_offset=self.local_expert_offset,
+                output_dtype=self.out_dtype,
+                moe_output=output,
+            )
+
+        if result.data_ptr() != output.data_ptr():
+            output.copy_(result)
 
 
 class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):

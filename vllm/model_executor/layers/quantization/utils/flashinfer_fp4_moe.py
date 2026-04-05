@@ -33,6 +33,97 @@ __all__ = [
 ]
 
 
+def _interleave_linear_and_gate(
+    x: torch.Tensor, group_size: int = 64, dim: int = -2
+) -> torch.Tensor:
+    """Interleave linear/gate rows to match FlashInfer CuTe DSL SwiGLU path."""
+    sizes = x.size()
+    dim = dim % x.dim()
+    assert sizes[dim] % (group_size * 2) == 0
+    prev_sizes = sizes[:dim]
+    post_sizes = sizes[dim + 1 :]
+    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size, *post_sizes)
+    x = x.transpose(dim, dim + 1).contiguous().view(*sizes)
+    return x
+
+
+def _to_cutedsl_mma_scale(
+    scale: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """
+    Convert linear per-row FP4 scales to the 6D MMA layout used by FlashInfer's
+    standard-format CuTe DSL MoE API.
+    """
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    scale_swizzled = swizzle_blockscale(scale)
+    _, m_padded, k_padded = scale_swizzled.shape
+    scale_2d = scale_swizzled.reshape(num_groups * m_padded, k_padded)
+    return convert_sf_to_mma_layout(
+        scale_2d,
+        m=m,
+        k=k,
+        num_groups=num_groups,
+        sf_vec_size=sf_vec_size,
+    )
+
+
+def prepare_nvfp4_moe_layer_for_cutedsl_standard(
+    layer: "FusedMoE",
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_scale_2: torch.Tensor,
+    a13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_scale_2: torch.Tensor,
+    a2_scale: torch.Tensor,
+    is_act_and_mul: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    Prepare tensors exactly in the style expected by FlashInfer's standard
+    CuTe DSL NVFP4 MoE API, following FlashInfer's own unit tests.
+    """
+    del layer
+
+    num_experts = w13.shape[0]
+
+    if is_act_and_mul:
+        w13 = _interleave_linear_and_gate(w13)
+        w13_scale = _interleave_linear_and_gate(w13_scale)
+
+    a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
+    a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
+
+    w13_scale = _to_cutedsl_mma_scale(
+        w13_scale,
+        m=w13.shape[1],
+        k=w13.shape[2] * 2,
+        num_groups=num_experts,
+    )
+    w2_scale = _to_cutedsl_mma_scale(
+        w2_scale,
+        m=w2.shape[1],
+        k=w2.shape[2] * 2,
+        num_groups=num_experts,
+    )
+
+    return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+
+
 def is_flashinfer_fp4_cutlass_moe_available() -> bool:
     """Return `True` when FlashInfer CUTLASS NV-FP4 kernels can be used."""
     return (
@@ -338,6 +429,22 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
     else:
         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
+
+    if backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and getattr(
+        layer, "_flashinfer_cutedsl_standard", False
+    ):
+        return prepare_nvfp4_moe_layer_for_cutedsl_standard(
+            layer=layer,
+            w13=w13,
+            w13_scale=w13_scale,
+            w13_scale_2=w13_scale_2,
+            a13_scale=a13_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            w2_scale_2=w2_scale_2,
+            a2_scale=a2_scale,
+            is_act_and_mul=is_act_and_mul,
+        )
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:

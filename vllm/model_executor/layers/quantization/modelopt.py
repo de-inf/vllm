@@ -40,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -1375,6 +1376,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 "Accuracy may be affected."
             )
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+
+        layer._flashinfer_cutedsl_standard = (
+            self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
+            and self.experts_cls is not None
+            and self.experts_cls.__name__ == "FlashInferCuteDSLStandardExperts"
+        )
 
         (
             w13,
