@@ -46,10 +46,23 @@ class FlashInferCuteDSLStandardExperts(mk.FusedMoEExpertsModular):
         self.local_expert_offset = (
             moe_config.moe_parallel_config.ep_rank * moe_config.num_local_experts
         )
+        self._fc2_input_scale: torch.Tensor | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
         layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+
+        # FlashInfer's standard CuTe DSL API expects a single FC2 input scale.
+        assert self.quant_config.a2_gscale is not None
+        if not torch.allclose(
+            self.quant_config.a2_gscale,
+            self.quant_config.a2_gscale[:1].expand_as(self.quant_config.a2_gscale),
+        ):
+            raise ValueError(
+                "FlashInferCuteDSLStandardExperts expects a single FC2 input "
+                "scale shared by all experts, but got non-uniform a2_gscale"
+            )
+        self._fc2_input_scale = self.quant_config.a2_gscale[:1]
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -162,18 +175,8 @@ class FlashInferCuteDSLStandardExperts(mk.FusedMoEExpertsModular):
                 f"and w2_scale.shape={tuple(self.w2_scale.shape)}"
             )
 
-        # FlashInfer's standard CuTe DSL API expects per-expert GEMM alphas and
-        # a scalar FC2 input scale. vLLM stores the FC2 input scale per expert,
-        # but the preprocessing step expands the same scalar value to all
-        # experts, so collapse it back here before calling FlashInfer.
-        if not torch.allclose(
-            self.a2_gscale, self.a2_gscale[:1].expand_as(self.a2_gscale)
-        ):
-            raise ValueError(
-                "FlashInferCuteDSLStandardExperts expects a single FC2 input "
-                "scale shared by all experts, but got non-uniform a2_gscale"
-            )
-        fc2_input_scale = self.a2_gscale[:1].to(
+        assert self._fc2_input_scale is not None
+        fc2_input_scale = self._fc2_input_scale.to(
             dtype=torch.float32, device=hidden_states.device
         )
 
