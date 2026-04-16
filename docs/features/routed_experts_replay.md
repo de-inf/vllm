@@ -106,7 +106,7 @@ When a request has multiple completions (`n > 1`), each completion shares the sa
 
 ### Data Flow
 
-```
+```text
 Forward Pass                    Async D2H Pipeline              Output
 ─────────────                   ──────────────────              ──────
 FusedMoE layer                  After forward pass:             On request finish:
@@ -234,17 +234,17 @@ The overhead is dominated by the per-layer `.copy_()` during the forward pass. T
 
 ## Supported Configurations
 
-| Configuration | Supported |
-|--------------|-----------|
-| BF16 Triton MoE (non-monolithic) | Yes |
-| FP8/MXFP8 FlashInfer MoE (monolithic) | Yes (requires FlashInfer with `routing_replay_out`) |
-| CUDA graphs | Yes |
-| Multi-node tensor parallelism | Yes |
-| Data parallelism (DP) | Yes |
-| Expert parallelism (EP) | Yes |
-| Prefix caching | Yes (cached positions marked with `-1` sentinel) |
-| MTP speculative decoding | Yes (generation routing trimmed to accepted tokens) |
-| `n > 1` (multiple completions) | Yes (prompt routing shared, gen routing per-completion) |
+| Configuration                            | Supported                                                 |
+|------------------------------------------|-----------------------------------------------------------|
+| BF16 Triton MoE (non-monolithic)         | Yes                                                       |
+| FP8/MXFP8 FlashInfer MoE (monolithic)    | Yes (requires FlashInfer with `routing_replay_out`)       |
+| CUDA graphs                              | Yes                                                       |
+| Multi-node tensor parallelism            | Yes                                                       |
+| Data parallelism (DP)                    | Yes                                                       |
+| Expert parallelism (EP)                  | Yes                                                       |
+| Prefix caching                           | Yes (cached positions marked with `-1` sentinel)          |
+| MTP speculative decoding                 | Yes (gen routing trimmed to accepted tokens)              |
+| `n > 1` (multiple completions)           | Yes (prompt routing shared, gen routing per-completion)   |
 
 ## Limitations
 
@@ -253,9 +253,9 @@ The overhead is dominated by the per-layer `.copy_()` during the forward pass. T
 
 ## CLI Reference
 
-| Flag | Description |
-|------|-------------|
-| `--enable-return-routed-experts` | Enable routing replay capture and return expert IDs in API responses. |
+| Flag                               | Description                                                            |
+|------------------------------------|------------------------------------------------------------------------|
+| `--enable-return-routed-experts`   | Enable routing replay capture and return expert IDs in API responses.  |
 
 ## API Reference
 
@@ -263,15 +263,15 @@ The overhead is dominated by the per-layer `.copy_()` during the forward pass. T
 
 **Response-level field:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `prompt_routed_experts` | `list[list[list[int]]]` or `null` | Expert IDs for prompt tokens. Shape: `[prompt_len, num_moe_layers, top_k]`. |
+| Field                     | Type                                | Description                                                                 |
+|---------------------------|-------------------------------------|-----------------------------------------------------------------------------|
+| `prompt_routed_experts`   | `list[list[list[int]]]` or `null`   | Expert IDs for prompt tokens. Shape: `[prompt_len, num_moe_layers, top_k]`. |
 
 **Choice-level field:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `routed_experts` | `list[list[list[int]]]` or `null` | Expert IDs for generated tokens. Shape: `[gen_len, num_moe_layers, top_k]`. |
+| Field              | Type                                | Description                                                                   |
+|--------------------|-------------------------------------|-------------------------------------------------------------------------------|
+| `routed_experts`   | `list[list[list[int]]]` or `null`   | Expert IDs for generated tokens. Shape: `[gen_len, num_moe_layers, top_k]`.   |
 
 ### Chat Completions (`/v1/chat/completions`)
 
@@ -279,7 +279,7 @@ Same fields as above on `ChatCompletionResponse` and `ChatCompletionResponseChoi
 
 ### Python SDK
 
-| Object | Field | Type | Description |
-|--------|-------|------|-------------|
-| `RequestOutput` | `prompt_routed_experts` | `np.ndarray` or `None` | `[prompt_len, L, K]` int16 |
-| `CompletionOutput` | `routed_experts` | `np.ndarray` or `None` | `[gen_len, L, K]` int16 |
+| Object               | Field                     | Type                     | Description                 |
+|----------------------|---------------------------|--------------------------|-----------------------------|
+| `RequestOutput`      | `prompt_routed_experts`   | `np.ndarray` or `None`   | `[prompt_len, L, K]` i16    |
+| `CompletionOutput`   | `routed_experts`          | `np.ndarray` or `None`   | `[gen_len, L, K]` int16     |

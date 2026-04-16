@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import msgspec
-import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest

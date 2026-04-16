@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import types
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -228,10 +226,11 @@ class TestRoutedExpertsHostCache:
 
     def test_sentinel_initialization(self):
         """Host cache initializes with zeros by default."""
+        import numpy as np
+
         from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
             _RoutedExpertsHostCache,
         )
-        import numpy as np
 
         cache = _RoutedExpertsHostCache(
             num_hidden_layers=40,
@@ -269,4 +268,3 @@ class TestRoutedExpertsHostCache:
         cache.get_or_grow_buffer("req1", max_pos=50)
         cache.free_request("req1")
         assert cache.get_buffer("req1") is None
-

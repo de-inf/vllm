@@ -4335,14 +4335,13 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_dict = None
             if self.routed_experts_initialized:
-                routed_experts_dict = (
-                    extract_routed_experts_for_current_batch(
-                        req_ids=req_ids_output_copy,
-                        requests=self.requests,
-                        req_id_to_index=self.input_batch.req_id_to_index,
-                        num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                        max_model_len=self.max_model_len,
-                    ))
+                routed_experts_dict = extract_routed_experts_for_current_batch(
+                    req_ids=req_ids_output_copy,
+                    requests=self.requests,
+                    req_id_to_index=self.input_batch.req_id_to_index,
+                    num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+                    max_model_len=self.max_model_len,
+                )
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -6890,6 +6889,7 @@ class GPUModelRunner(
         from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
             bind_routing_capture_to_model,
         )
+
         bind_routing_capture_to_model(self.model)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:

@@ -11,6 +11,9 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    split_routed_experts,
+)
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -25,9 +28,6 @@ from vllm.tracing import (
     SpanKind,
     extract_trace_context,
     instrument_manual,
-)
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    split_routed_experts,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -323,12 +323,15 @@ class RequestState:
         prompt_routed_experts = None
         gen_routed_experts = None
         if routed_experts is not None:
-            prompt_len = (len(self.prompt_token_ids)
-                          if self.prompt_token_ids else 0)
-            num_gen = (self.detokenizer.num_output_tokens()
-                       if self.detokenizer is not None else None)
+            prompt_len = len(self.prompt_token_ids) if self.prompt_token_ids else 0
+            num_gen = (
+                self.detokenizer.num_output_tokens()
+                if self.detokenizer is not None
+                else None
+            )
             prompt_routed_experts, gen_routed_experts = split_routed_experts(
-                routed_experts, prompt_len, num_gen)
+                routed_experts, prompt_len, num_gen
+            )
 
         output = self._new_completion_output(
             new_token_ids, finish_reason, stop_reason, gen_routed_experts
@@ -343,7 +346,10 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params,
+            external_req_id,
+            outputs,
+            finished,
+            kv_transfer_params,
             prompt_routed_experts,
         )
 
@@ -639,8 +645,7 @@ class OutputProcessor:
 
             if routed_experts is not None:
                 shape, data = routed_experts
-                routed_experts = np.frombuffer(data, dtype=np.int16).reshape(
-                    shape)
+                routed_experts = np.frombuffer(data, dtype=np.int16).reshape(shape)
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

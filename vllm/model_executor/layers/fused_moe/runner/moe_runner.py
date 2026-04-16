@@ -462,9 +462,7 @@ class MoERunner(MoERunnerInterface):
 
             # Write routing data for non-monolithic path (Triton, etc.)
             if routing_replay_out is not None:
-                routing_replay_out[: topk_ids.shape[0]].copy_(
-                    topk_ids.to(torch.int16)
-                )
+                routing_replay_out[: topk_ids.shape[0]].copy_(topk_ids.to(torch.int16))
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.

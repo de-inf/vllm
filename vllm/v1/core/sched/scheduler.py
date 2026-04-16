@@ -7,8 +7,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-import numpy as np
-
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -1386,8 +1384,10 @@ class Scheduler(SchedulerInterface):
 
             # Get routing data from ModelRunnerOutput (via worker D2H pipeline)
             routed_experts = None
-            if (model_runner_output.routed_experts_dict is not None
-                    and req_id in model_runner_output.routed_experts_dict):
+            if (
+                model_runner_output.routed_experts_dict is not None
+                and req_id in model_runner_output.routed_experts_dict
+            ):
                 routed_experts = model_runner_output.routed_experts_dict[req_id]
             finish_reason = None
             if stopped:

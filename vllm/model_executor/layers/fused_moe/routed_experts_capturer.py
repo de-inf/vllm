@@ -1,13 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import contextlib
 import logging
-from abc import ABC
+from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
 import torch.distributed
-from vllm.config.model import ModelConfig
 
+from vllm.config.model import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +87,7 @@ class _RoutedExpertsDeviceCache:
     def _finalize_allocation_log(self):
         buf_mb = self.get_buffer_size_bytes() / _MB
         logger.info(
-            "Routing experts device buffer allocated. "
-            "shape=%s, size=%.2f MB",
+            "Routing experts device buffer allocated. shape=%s, size=%.2f MB",
             tuple(self.buffer.shape),
             buf_mb,
         )
@@ -194,6 +196,7 @@ class RoutedExpertsCapturer(ABC):
             )
         return _RoutedExpertsCapturerNoop()
 
+    @abstractmethod
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
@@ -369,6 +372,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         )
         positions_np = self._pending_positions
         host_cache = self.host_cache
+        assert self._pending_num_scheduled is not None
+        assert positions_np is not None
+        assert host_cache is not None
 
         offset = 0
         for req_id, n_tokens in self._pending_num_scheduled.items():
@@ -554,9 +560,7 @@ def extract_routed_experts_for_current_batch(
         seqlen = host_cache.get_filled_len(req_id)
         if seqlen <= 0:
             continue
-        experts = capturer.get_routed_experts(
-            req_id, seqlen=seqlen, free_slot=False
-        )
+        experts = capturer.get_routed_experts(req_id, seqlen=seqlen, free_slot=False)
         if experts is not None:
             result[req_id] = (experts.shape, experts.tobytes())
 
@@ -617,9 +621,11 @@ def split_routed_experts(
     gen_routed_experts = routed_experts[prompt_len:]
 
     # Clip generation routing to match actual output tokens.
-    if (num_output_tokens is not None
-            and gen_routed_experts.shape[0] > num_output_tokens
-            and num_output_tokens > 0):
+    if (
+        num_output_tokens is not None
+        and gen_routed_experts.shape[0] > num_output_tokens
+        and num_output_tokens > 0
+    ):
         gen_routed_experts = gen_routed_experts[:num_output_tokens]
 
     if prompt_routed_experts.size == 0:
@@ -670,9 +676,7 @@ def init_routed_experts_capturer_with_shared_cache(
         # no D2H pipeline) so that ALL ranks have a real device buffer.
         # This ensures the custom op call in every MoE layer produces
         # identical CUDA graph structure across TP ranks.
-        logger.info(
-            "Creating device-only routed experts capturer for rank %s", rank
-        )
+        logger.info("Creating device-only routed experts capturer for rank %s", rank)
         capturer = RoutedExpertsCapturer.create(
             enable=True,
             model_config=model_config,
@@ -719,10 +723,8 @@ def bind_routing_capture_to_model(model) -> None:
         torch.compiler.cudagraph_mark_tensor_static(buffer)
     elif hasattr(torch._C, "_set_static_address_tag"):
         torch._C._set_static_address_tag(buffer, True)
-    try:
+    with contextlib.suppress(Exception):
         torch._dynamo.mark_static_address(buffer)
-    except Exception:
-        pass
 
     bound = 0
     for module in model.modules():
@@ -734,15 +736,12 @@ def bind_routing_capture_to_model(model) -> None:
             # snapshot/restore or relocate the buffer during replay.
             if hasattr(torch.compiler, "cudagraph_mark_tensor_static"):
                 torch.compiler.cudagraph_mark_tensor_static(layer_buf)
-            try:
+            with contextlib.suppress(Exception):
                 torch._dynamo.mark_static_address(layer_buf)
-            except Exception:
-                pass
             bound += 1
 
     logger.info(
-        "Bound routing capture buffer to %s FusedMoE layers. "
-        "Buffer shape=%s",
+        "Bound routing capture buffer to %s FusedMoE layers. Buffer shape=%s",
         bound,
         tuple(buffer.shape),
     )
