@@ -1087,6 +1087,21 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
+        # Free routed experts host cache buffers for finished/preempted
+        # requests.  Finished requests had their data extracted in the
+        # PREVIOUS step; preempted requests will be re-prefilled.
+        if self.routed_experts_initialized:
+            host_cache = get_global_experts_capturer().get_host_cache()
+            if host_cache is not None:
+                for req_id in scheduler_output.finished_req_ids:
+                    host_cache.free_request(req_id)
+                if (
+                    hasattr(scheduler_output, "preempted_req_ids")
+                    and scheduler_output.preempted_req_ids
+                ):
+                    for req_id in scheduler_output.preempted_req_ids:
+                        host_cache.free_request(req_id)
+
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
