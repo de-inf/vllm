@@ -567,6 +567,29 @@ def extract_routed_experts_for_current_batch(
     return result if result else None
 
 
+def free_routing_buffers(
+    finished_req_ids: set[str],
+    preempted_req_ids: set[str] | None = None,
+) -> None:
+    """Free host cache buffers for finished and preempted requests.
+
+    Finished requests had their routing data extracted in the previous
+    step; preempted requests will be re-prefilled from scratch.
+    """
+    capturer = get_global_experts_capturer()
+    if capturer is None:
+        return
+    host_cache = capturer.get_host_cache()
+    if host_cache is None:
+        return
+
+    for req_id in finished_req_ids:
+        host_cache.free_request(req_id)
+    if preempted_req_ids:
+        for req_id in preempted_req_ids:
+            host_cache.free_request(req_id)
+
+
 def issue_routing_d2h_copy(
     input_batch_req_ids: list[str],
     num_scheduled_tokens: dict[str, int],
