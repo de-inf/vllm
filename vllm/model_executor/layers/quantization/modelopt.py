@@ -1692,8 +1692,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
-        layer.hidden_size = hidden_size
         layer.orig_dtype = params_dtype
 
         if hidden_size % MXFP8_BLOCK_SIZE != 0:
