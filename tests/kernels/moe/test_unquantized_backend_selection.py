@@ -190,3 +190,68 @@ def test_select_cuda_flashinfer_cutlass_backend(
 
         assert selected_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS
         assert experts_cls is not None
+
+
+def test_select_lora_backend_prefers_triton():
+    """LoRA-enabled unquantized MoE should select Triton backend."""
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "is_rocm", return_value=False),
+        patch.object(current_platform, "is_cpu", return_value=False),
+        patch.object(current_platform, "is_xpu", return_value=False),
+        patch.object(current_platform, "is_tpu", return_value=False),
+        patch.object(current_platform, "is_out_of_tree", return_value=False),
+    ):
+        moe_config = make_dummy_moe_config()
+        moe_config.is_lora_enabled = True
+
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
+
+        assert selected_backend == UnquantizedMoeBackend.TRITON
+        assert experts_cls is not None
+
+
+def test_select_lora_backend_prefers_batched_triton():
+    """LoRA-enabled batched activation format should use Batched Triton."""
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "is_rocm", return_value=False),
+        patch.object(current_platform, "is_cpu", return_value=False),
+        patch.object(current_platform, "is_xpu", return_value=False),
+        patch.object(current_platform, "is_tpu", return_value=False),
+        patch.object(current_platform, "is_out_of_tree", return_value=False),
+    ):
+        moe_config = make_dummy_moe_config()
+        moe_config.is_lora_enabled = True
+        # Batched activation format is computed from DP+EP with deepep_low_latency.
+        moe_config.moe_parallel_config.dp_size = 2
+        moe_config.moe_parallel_config.use_ep = True
+        moe_config.moe_parallel_config.all2all_backend = "deepep_low_latency"
+
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
+
+        assert selected_backend == UnquantizedMoeBackend.BATCHED_TRITON
+        assert experts_cls is not None
+
+
+def test_select_lora_explicit_non_triton_backend_raises():
+    """LoRA should reject explicit non-Triton unquantized backends."""
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "is_rocm", return_value=False),
+        patch.object(current_platform, "is_cpu", return_value=False),
+        patch.object(current_platform, "is_xpu", return_value=False),
+        patch.object(current_platform, "is_tpu", return_value=False),
+        patch.object(current_platform, "is_out_of_tree", return_value=False),
+    ):
+        moe_config = make_dummy_moe_config()
+        moe_config.is_lora_enabled = True
+        # Use string from mapping in function map_unquantized_backend()
+        moe_config.moe_backend = "flashinfer_cutlass"
+
+        with pytest.raises(ValueError, match="LoRA is only supported"):
+            select_unquantized_moe_backend(moe_config=moe_config)

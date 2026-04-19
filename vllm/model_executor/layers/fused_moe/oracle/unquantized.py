@@ -166,6 +166,15 @@ def select_unquantized_moe_backend(
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = _get_priority_backends(moe_config)
 
+    if moe_config.is_lora_enabled:
+        # LoRA currently only supports Triton-based backends.
+        AVAILABLE_BACKENDS = [
+            backend
+            for backend in AVAILABLE_BACKENDS
+            if backend
+            in (UnquantizedMoeBackend.TRITON, UnquantizedMoeBackend.BATCHED_TRITON)
+        ]
+
     # NOTE(rob): We need to peak into the P/F selection to determine
     # if we are using the batched or standard expert format, which
     # if not ideal. Once we unify TP + DP/EP, we can select P/F first.
@@ -212,6 +221,13 @@ def select_unquantized_moe_backend(
     runner_backend = moe_config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_unquantized_backend(runner_backend)
+        if moe_config.is_lora_enabled and requested_backend not in (
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        ):
+            raise ValueError(
+                "LoRA is only supported for Triton-based unquantized MoE backends."
+            )
         if (
             activation_format == mk.FusedMoEActivationFormat.BatchedExperts
             and requested_backend == UnquantizedMoeBackend.TRITON
