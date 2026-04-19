@@ -246,6 +246,45 @@ def test_select_lora_explicit_non_triton_backend_raises():
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
 )
+@pytest.mark.parametrize("is_lora_enabled", [False, True])
+def test_select_explicit_triton_backend(is_lora_enabled):
+    """Explicit triton backend selection should return Triton."""
+    with mock_cuda_platform():
+        moe_config = make_dummy_moe_config()
+        moe_config.is_lora_enabled = is_lora_enabled
+        moe_config.moe_backend = "triton"
+
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
+
+        assert selected_backend == UnquantizedMoeBackend.TRITON
+        assert experts_cls is not None
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
+)
+def test_select_explicit_triton_ignores_flashinfer_env(monkeypatch):
+    """Explicit triton backend should override FlashInfer env selection."""
+    with mock_cuda_platform():
+        monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
+        monkeypatch.setenv("VLLM_FLASHINFER_MOE_BACKEND", "throughput")
+
+        moe_config = make_dummy_moe_config()
+        moe_config.moe_backend = "triton"
+
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
+
+        assert selected_backend == UnquantizedMoeBackend.TRITON
+        assert experts_cls is not None
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
+)
 def test_select_cuda_lora_ignores_flashinfer_env(monkeypatch):
     """CUDA LoRA path should still choose Triton even if FlashInfer env is on."""
     with mock_cuda_platform():
