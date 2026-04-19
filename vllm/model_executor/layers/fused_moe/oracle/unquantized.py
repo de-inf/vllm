@@ -171,8 +171,7 @@ def select_unquantized_moe_backend(
         AVAILABLE_BACKENDS = [
             backend
             for backend in AVAILABLE_BACKENDS
-            if backend
-            in (UnquantizedMoeBackend.TRITON, UnquantizedMoeBackend.BATCHED_TRITON)
+            if backend == UnquantizedMoeBackend.TRITON
         ]
 
     # NOTE(rob): We need to peak into the P/F selection to determine
@@ -221,12 +220,12 @@ def select_unquantized_moe_backend(
     runner_backend = moe_config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_unquantized_backend(runner_backend)
-        if moe_config.is_lora_enabled and requested_backend not in (
-            UnquantizedMoeBackend.TRITON,
-            UnquantizedMoeBackend.BATCHED_TRITON,
+        if (
+            moe_config.is_lora_enabled
+            and requested_backend != UnquantizedMoeBackend.TRITON
         ):
             raise ValueError(
-                "LoRA is only supported for Triton-based unquantized MoE backends."
+                "LoRA is only supported for Triton unquantized MoE backend."
             )
         if (
             activation_format == mk.FusedMoEActivationFormat.BatchedExperts

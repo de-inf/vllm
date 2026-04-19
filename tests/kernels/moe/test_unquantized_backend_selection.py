@@ -226,28 +226,6 @@ def test_select_lora_backend_prefers_triton():
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
 )
-def test_select_lora_backend_prefers_batched_triton():
-    """LoRA-enabled batched activation format should select batched Triton."""
-    with mock_cuda_platform():
-        moe_config = make_dummy_moe_config()
-        moe_config.is_lora_enabled = True
-
-        # Batched activation format is computed from DP+EP with deepep_low_latency.
-        moe_config.moe_parallel_config.dp_size = 2
-        moe_config.moe_parallel_config.use_ep = True
-        moe_config.moe_parallel_config.all2all_backend = "deepep_low_latency"
-
-        selected_backend, experts_cls = select_unquantized_moe_backend(
-            moe_config=moe_config
-        )
-
-        assert selected_backend == UnquantizedMoeBackend.BATCHED_TRITON
-        assert experts_cls is not None
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
-)
 def test_select_lora_explicit_non_triton_backend_raises():
     """LoRA should reject explicit non-Triton unquantized backends."""
     with mock_cuda_platform():
