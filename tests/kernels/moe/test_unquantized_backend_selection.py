@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -192,8 +193,8 @@ def test_select_cuda_flashinfer_cutlass_backend(
         assert experts_cls is not None
 
 
-def test_select_lora_backend_prefers_triton():
-    """LoRA-enabled unquantized MoE should select Triton backend."""
+@contextmanager
+def mock_cuda_platform():
     with (
         patch.object(current_platform, "is_cuda", return_value=True),
         patch.object(current_platform, "is_rocm", return_value=False),
@@ -202,6 +203,15 @@ def test_select_lora_backend_prefers_triton():
         patch.object(current_platform, "is_tpu", return_value=False),
         patch.object(current_platform, "is_out_of_tree", return_value=False),
     ):
+        yield
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
+)
+def test_select_lora_backend_prefers_triton():
+    """LoRA-enabled unquantized MoE should select Triton backend."""
+    with mock_cuda_platform():
         moe_config = make_dummy_moe_config()
         moe_config.is_lora_enabled = True
 
@@ -213,18 +223,15 @@ def test_select_lora_backend_prefers_triton():
         assert experts_cls is not None
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
+)
 def test_select_lora_backend_prefers_batched_triton():
-    """LoRA-enabled batched activation format should use Batched Triton."""
-    with (
-        patch.object(current_platform, "is_cuda", return_value=True),
-        patch.object(current_platform, "is_rocm", return_value=False),
-        patch.object(current_platform, "is_cpu", return_value=False),
-        patch.object(current_platform, "is_xpu", return_value=False),
-        patch.object(current_platform, "is_tpu", return_value=False),
-        patch.object(current_platform, "is_out_of_tree", return_value=False),
-    ):
+    """LoRA-enabled batched activation format should select batched Triton."""
+    with mock_cuda_platform():
         moe_config = make_dummy_moe_config()
         moe_config.is_lora_enabled = True
+
         # Batched activation format is computed from DP+EP with deepep_low_latency.
         moe_config.moe_parallel_config.dp_size = 2
         moe_config.moe_parallel_config.use_ep = True
@@ -238,18 +245,15 @@ def test_select_lora_backend_prefers_batched_triton():
         assert experts_cls is not None
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
+)
 def test_select_lora_explicit_non_triton_backend_raises():
     """LoRA should reject explicit non-Triton unquantized backends."""
-    with (
-        patch.object(current_platform, "is_cuda", return_value=True),
-        patch.object(current_platform, "is_rocm", return_value=False),
-        patch.object(current_platform, "is_cpu", return_value=False),
-        patch.object(current_platform, "is_xpu", return_value=False),
-        patch.object(current_platform, "is_tpu", return_value=False),
-        patch.object(current_platform, "is_out_of_tree", return_value=False),
-    ):
+    with mock_cuda_platform():
         moe_config = make_dummy_moe_config()
         moe_config.is_lora_enabled = True
+
         # Use string from mapping in function map_unquantized_backend()
         moe_config.moe_backend = "flashinfer_cutlass"
 
