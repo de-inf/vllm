@@ -166,7 +166,8 @@ def select_unquantized_moe_backend(
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = _get_priority_backends(moe_config)
 
-    if moe_config.is_lora_enabled:
+    is_cuda_lora = moe_config.is_lora_enabled and current_platform.is_cuda()
+    if is_cuda_lora:
         # LoRA currently only supports Triton-based backends.
         AVAILABLE_BACKENDS = [
             backend
@@ -220,10 +221,7 @@ def select_unquantized_moe_backend(
     runner_backend = moe_config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_unquantized_backend(runner_backend)
-        if (
-            moe_config.is_lora_enabled
-            and requested_backend != UnquantizedMoeBackend.TRITON
-        ):
+        if is_cuda_lora and requested_backend != UnquantizedMoeBackend.TRITON:
             raise ValueError(
                 "LoRA is only supported for Triton unquantized MoE backend."
             )
@@ -236,7 +234,7 @@ def select_unquantized_moe_backend(
         return _return_or_raise(requested_backend, moe_config, activation_format)
 
     # Handle explicit FlashInfer FP16 configuration.
-    if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP16"):
+    if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP16") and not is_cuda_lora:
         if not envs.VLLM_USE_FLASHINFER_MOE_FP16:
             if UnquantizedMoeBackend.FLASHINFER_TRTLLM in AVAILABLE_BACKENDS:
                 AVAILABLE_BACKENDS.remove(UnquantizedMoeBackend.FLASHINFER_TRTLLM)
