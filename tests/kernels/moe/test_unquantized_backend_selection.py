@@ -11,7 +11,7 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 )
 from vllm.platforms import current_platform
 
-skipif_lora = pytest.mark.skipif(
+skipif_not_cuda_rocm = pytest.mark.skipif(
     not (current_platform.is_cuda() or current_platform.is_rocm()),
     reason="Only supported on CUDA/ROCm platforms.",
 )
@@ -197,7 +197,7 @@ def test_select_cuda_flashinfer_cutlass_backend(
         assert experts_cls is not None
 
 
-@skipif_lora
+@skipif_not_cuda_rocm
 def test_select_lora_backend_prefers_triton():
     """LoRA-enabled unquantized MoE should select Triton backend."""
     moe_config = make_dummy_moe_config()
@@ -210,7 +210,7 @@ def test_select_lora_backend_prefers_triton():
     assert experts_cls is not None
 
 
-@skipif_lora
+@skipif_not_cuda_rocm
 def test_select_lora_explicit_non_triton_backend():
     """LoRA should override explicit non-Triton backend to Triton."""
     moe_config = make_dummy_moe_config()
@@ -227,7 +227,7 @@ def test_select_lora_explicit_non_triton_backend():
     assert experts_cls is not None
 
 
-@skipif_lora
+@skipif_not_cuda_rocm
 @pytest.mark.parametrize("is_lora_enabled", [False, True])
 def test_select_explicit_triton_backend(is_lora_enabled):
     """Explicit triton backend selection should return Triton."""
@@ -243,7 +243,7 @@ def test_select_explicit_triton_backend(is_lora_enabled):
     assert experts_cls is not None
 
 
-@skipif_lora
+@skipif_not_cuda_rocm
 def test_select_explicit_triton_ignores_flashinfer_env(monkeypatch):
     """Explicit triton backend should override FlashInfer env selection."""
     monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
@@ -261,7 +261,7 @@ def test_select_explicit_triton_ignores_flashinfer_env(monkeypatch):
     assert experts_cls is not None
 
 
-@skipif_lora
+@skipif_not_cuda_rocm
 def test_select_lora_ignores_flashinfer_env(monkeypatch):
     """LoRA path should still choose Triton even if FlashInfer env is on."""
     monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
