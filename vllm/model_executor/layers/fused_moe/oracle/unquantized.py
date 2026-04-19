@@ -163,11 +163,7 @@ def select_unquantized_moe_backend(
     if current_platform.is_out_of_tree():
         return UnquantizedMoeBackend.OOT, None
 
-    # Both CUDA and ROCm require Triton for LoRA support
-    # Triton not relevant for current_platform.is_xpu()
-    triton_lora_supported = current_platform.is_cuda() or current_platform.is_rocm()
-
-    if moe_config.is_lora_enabled and triton_lora_supported:
+    if moe_config.is_lora_enabled:
         return UnquantizedMoeBackend.TRITON, backend_to_kernel_cls(
             UnquantizedMoeBackend.TRITON
         )
