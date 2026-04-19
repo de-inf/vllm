@@ -198,7 +198,7 @@ def test_select_cuda_flashinfer_cutlass_backend(
 
 
 @contextmanager
-def mock_cuda_platform():
+def mock_cuda_moe_config(is_lora_enabled: bool = False):
     with (
         patch.object(current_platform, "is_cuda", return_value=True),
         patch.object(current_platform, "is_rocm", return_value=False),
@@ -207,7 +207,9 @@ def mock_cuda_platform():
         patch.object(current_platform, "is_tpu", return_value=False),
         patch.object(current_platform, "is_out_of_tree", return_value=False),
     ):
-        yield
+        moe_config = make_dummy_moe_config()
+        moe_config.is_lora_enabled = is_lora_enabled
+        yield moe_config
 
 
 @pytest.mark.skipif(
@@ -215,10 +217,7 @@ def mock_cuda_platform():
 )
 def test_select_lora_backend_prefers_triton():
     """LoRA-enabled unquantized MoE should select Triton backend."""
-    with mock_cuda_platform():
-        moe_config = make_dummy_moe_config()
-        moe_config.is_lora_enabled = True
-
+    with mock_cuda_moe_config(is_lora_enabled=True) as moe_config:
         selected_backend, experts_cls = select_unquantized_moe_backend(
             moe_config=moe_config
         )
@@ -232,10 +231,7 @@ def test_select_lora_backend_prefers_triton():
 )
 def test_select_lora_explicit_non_triton_backend_raises():
     """LoRA should reject explicit non-Triton unquantized backends."""
-    with mock_cuda_platform():
-        moe_config = make_dummy_moe_config()
-        moe_config.is_lora_enabled = True
-
+    with mock_cuda_moe_config(is_lora_enabled=True) as moe_config:
         # Use string from mapping in function map_unquantized_backend()
         moe_config.moe_backend = "flashinfer_cutlass"
 
@@ -249,9 +245,7 @@ def test_select_lora_explicit_non_triton_backend_raises():
 @pytest.mark.parametrize("is_lora_enabled", [False, True])
 def test_select_explicit_triton_backend(is_lora_enabled):
     """Explicit triton backend selection should return Triton."""
-    with mock_cuda_platform():
-        moe_config = make_dummy_moe_config()
-        moe_config.is_lora_enabled = is_lora_enabled
+    with mock_cuda_moe_config(is_lora_enabled=is_lora_enabled) as moe_config:
         moe_config.moe_backend = "triton"
 
         selected_backend, experts_cls = select_unquantized_moe_backend(
@@ -267,11 +261,10 @@ def test_select_explicit_triton_backend(is_lora_enabled):
 )
 def test_select_explicit_triton_ignores_flashinfer_env(monkeypatch):
     """Explicit triton backend should override FlashInfer env selection."""
-    with mock_cuda_platform():
+    with mock_cuda_moe_config(is_lora_enabled=False) as moe_config:
         monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
         monkeypatch.setenv("VLLM_FLASHINFER_MOE_BACKEND", "throughput")
 
-        moe_config = make_dummy_moe_config()
         moe_config.moe_backend = "triton"
 
         selected_backend, experts_cls = select_unquantized_moe_backend(
@@ -287,12 +280,9 @@ def test_select_explicit_triton_ignores_flashinfer_env(monkeypatch):
 )
 def test_select_cuda_lora_ignores_flashinfer_env(monkeypatch):
     """CUDA LoRA path should still choose Triton even if FlashInfer env is on."""
-    with mock_cuda_platform():
+    with mock_cuda_moe_config(is_lora_enabled=True) as moe_config:
         monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_FP16", "1")
         monkeypatch.setenv("VLLM_FLASHINFER_MOE_BACKEND", "throughput")
-
-        moe_config = make_dummy_moe_config()
-        moe_config.is_lora_enabled = True
 
         selected_backend, experts_cls = select_unquantized_moe_backend(
             moe_config=moe_config
