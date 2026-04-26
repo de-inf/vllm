@@ -5,7 +5,6 @@ import os
 from typing import TYPE_CHECKING
 
 import huggingface_hub
-import regex as re
 from huggingface_hub.utils import HfHubHTTPError, HFValidationError
 from torch import nn
 from transformers import PretrainedConfig
@@ -235,9 +234,11 @@ def is_supported_lora_module(
 ) -> bool:
     """Check if a module is in the model's supported LoRA modules.
 
-    Uses regex suffix matching against the model-defined supported modules
-    list (e.g., matching "model.layers.0.self_attn.o_proj" against
-    "o_proj").
+    Matches on a dot-boundary suffix:
+    the entry ``"o_proj"`` matches the module name
+    ``"model.layers.0.self_attn.o_proj"`` (the ``.o_proj`` suffix),
+    while ``"proj"`` does not match ``"...o_proj"`` (no dot separator).
+    Exact matches are also accepted (``"o_proj"`` matches ``"o_proj"``).
 
     Args:
         module_name: Full dot-separated module name.
@@ -248,11 +249,7 @@ def is_supported_lora_module(
         True if the module is supported, False otherwise.
     """
     return any(
-        re.match(
-            r".*\.{target_module}$".format(target_module=target_module),
-            module_name,
-        )
-        or target_module == module_name
+        target_module == module_name or module_name.endswith("." + target_module)
         for target_module in supported_lora_modules
     )
 
