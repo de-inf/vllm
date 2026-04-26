@@ -7,10 +7,12 @@ Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
 """
 
+import time
 from typing import final
 
 import torch
 
+from vllm.lora._dbg import lora_dbg, lora_dbg_enabled
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import get_captured_lora_counts
 from vllm.triton_utils import HAS_TRITON, triton
@@ -80,12 +82,41 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         vocab_size: int,
         **kwargs,
     ):
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"PunicaGPU update_metadata ENTER "
+                f"is_prefill={mapping.is_prefill} max_loras={max_loras} "
+                f"vocab_size={vocab_size} lora_index_to_id={lora_index_to_id}"
+            )
+        _t_total = time.monotonic()
         self.is_prefill = mapping.is_prefill
+        _t = time.monotonic()
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"PunicaGPU update_metadata post _update_base_metadata "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
 
         # Prepare cuda kernel metadata tensors
+        _t = time.monotonic()
         self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"PunicaGPU update_metadata post token_mapping_meta.prepare_tensors "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
+        _t = time.monotonic()
         self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"PunicaGPU update_metadata post prompt_mapping_meta.prepare_tensors "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
+            lora_dbg(
+                f"PunicaGPU update_metadata EXIT total_dt="
+                f"{(time.monotonic() - _t_total) * 1000:.2f}ms"
+            )
 
     def add_shrink(
         self,

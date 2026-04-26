@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from contextlib import contextmanager
 from typing import Any, Literal
 
@@ -9,6 +10,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.exceptions import LoRAAdapterNotFoundError
 from vllm.logger import init_logger
+from vllm.lora._dbg import lora_dbg, lora_dbg_enabled
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.model_manager import (
     LoRAModelManager,
@@ -101,6 +103,13 @@ class WorkerLoRAManager:
         return lora_manager.model
 
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"_load_adapter ENTER lora_int_id={lora_request.lora_int_id} "
+                f"name={lora_request.lora_name!r} "
+                f"path={lora_request.lora_path!r}"
+            )
+        _t_total = time.monotonic()
         try:
             supported_lora_modules = self._adapter_manager.supported_lora_modules
             packed_modules_mapping = self._adapter_manager.packed_modules_mapping
@@ -114,12 +123,23 @@ class WorkerLoRAManager:
                     expected_lora_lst.append(module)
             expected_lora_modules = set(expected_lora_lst)
             lora_path = get_adapter_absolute_path(lora_request.lora_path)
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"_load_adapter resolved path={lora_path} "
+                    f"expected_lora_modules={sorted(expected_lora_modules)}"
+                )
 
+            _t = time.monotonic()
             peft_helper = PEFTHelper.from_local_dir(
                 lora_path,
                 self.max_position_embeddings,
                 lora_request.tensorizer_config_dict,
             )
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"_load_adapter PEFTHelper.from_local_dir "
+                    f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+                )
 
             # Validates the LoRA configuration against requirements before
             # loading weights, throwing an exception if validation fails.
@@ -133,6 +153,9 @@ class WorkerLoRAManager:
             # Get model-defined prefixes to skip during LoRA loading.
             lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
 
+            if lora_dbg_enabled():
+                lora_dbg("_load_adapter pre from_local_checkpoint")
+            _t = time.monotonic()
             lora = self._lora_model_cls.from_local_checkpoint(
                 lora_path,
                 expected_lora_modules,
@@ -145,6 +168,12 @@ class WorkerLoRAManager:
                 weights_mapper=hf_to_vllm_mapper,
                 skip_prefixes=lora_skip_prefixes,
             )
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"_load_adapter post from_local_checkpoint "
+                    f"dt={(time.monotonic() - _t) * 1000:.2f}ms "
+                    f"num_lora_modules={len(lora.loras)}"
+                )
 
             # Warn about adapter modules that will be ignored.
             target_modules = self.lora_config.target_modules
@@ -186,6 +215,11 @@ class WorkerLoRAManager:
         except Exception as e:
             raise e
 
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"_load_adapter EXIT lora_int_id={lora_request.lora_int_id} "
+                f"total_dt={(time.monotonic() - _t_total) * 1000:.2f}ms"
+            )
         return lora
 
     def add_dummy_lora(self, lora_request: LoRARequest, rank: int) -> bool:
@@ -208,9 +242,41 @@ class WorkerLoRAManager:
         return self._adapter_manager.pin_adapter(adapter_id)
 
     def set_active_adapters(self, requests: set[Any], mapping: Any | None) -> None:
+        if lora_dbg_enabled():
+            req_ids = sorted(
+                getattr(r, "lora_int_id", getattr(r, "adapter_id", "?"))
+                for r in requests
+                if r
+            )
+            mapping_summary = "None"
+            if mapping is not None:
+                mapping_summary = (
+                    f"type={type(mapping).__name__} "
+                    f"is_prefill={getattr(mapping, 'is_prefill', '?')} "
+                    f"n_token={len(getattr(mapping, 'index_mapping', ()) or ())} "
+                    f"n_prompt={len(getattr(mapping, 'prompt_mapping', ()) or ())}"
+                )
+            lora_dbg(
+                f"set_active_adapters ENTER req_ids={req_ids} "
+                f"mapping=({mapping_summary})"
+            )
+        _t = time.monotonic()
         self._apply_adapters(requests)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"set_active_adapters post _apply_adapters "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
         if mapping is not None:
+            _t2 = time.monotonic()
             self._adapter_manager.set_adapter_mapping(mapping)
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"set_active_adapters post set_adapter_mapping "
+                    f"dt={(time.monotonic() - _t2) * 1000:.2f}ms"
+                )
+        if lora_dbg_enabled():
+            lora_dbg("set_active_adapters EXIT")
 
     def supports_tower_connector_lora(self) -> bool:
         return (
@@ -303,6 +369,13 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         # This is ok because it's currently only called from
         # the single-threaded core engine loop.
 
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"LRU add_adapter ENTER lora_int_id={lora_request.lora_int_id} "
+                f"name={lora_request.lora_name!r} "
+                f"already_loaded={lora_request.lora_int_id in self.list_adapters()}"
+            )
+        _t_total = time.monotonic()
         if (
             lora_request.lora_int_id not in self.list_adapters()
             or lora_request.load_inplace
@@ -315,20 +388,49 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
 
             # Remove the existing adapter if it exists
             # Use case for LoRA inplace
+            if lora_dbg_enabled():
+                lora_dbg("LRU add_adapter pre remove_adapter")
             self._adapter_manager.remove_adapter(lora.id)
+            if lora_dbg_enabled():
+                lora_dbg("LRU add_adapter post remove_adapter")
 
             # Loading succeeded, now check if we will exceed cache capacity and
             # evict if the oldest adapter if so
             if len(self._adapter_manager) + 1 > self._adapter_manager.capacity:
                 assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
+                if lora_dbg_enabled():
+                    lora_dbg("LRU add_adapter pre remove_oldest_adapter")
                 self._adapter_manager.remove_oldest_adapter()
             # Then add the new adapter to the cache
+            if lora_dbg_enabled():
+                lora_dbg("LRU add_adapter pre manager.add_adapter")
+            _t = time.monotonic()
             loaded = self._adapter_manager.add_adapter(lora)
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"LRU add_adapter post manager.add_adapter "
+                    f"dt={(time.monotonic() - _t) * 1000:.2f}ms loaded={loaded}"
+                )
         else:
             # If the lora is already loaded, just touch it to
             # update its position in the caches
             loaded = (
                 self._adapter_manager.get_adapter(lora_request.lora_int_id) is not None
             )
+        if lora_dbg_enabled():
+            lora_dbg(
+                "LRU add_adapter pre manager.activate_adapter "
+                f"lora_int_id={lora_request.lora_int_id}"
+            )
+        _t = time.monotonic()
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"LRU add_adapter post manager.activate_adapter "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
+            lora_dbg(
+                f"LRU add_adapter EXIT total_dt="
+                f"{(time.monotonic() - _t_total) * 1000:.2f}ms loaded={loaded}"
+            )
         return loaded

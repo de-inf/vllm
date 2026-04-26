@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import time
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -11,6 +12,7 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
+from vllm.lora._dbg import lora_dbg, lora_dbg_enabled
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     FusedMoE3DWithLoRA,
@@ -267,7 +269,18 @@ class LoRAModelManager:
         lora_id: int,
     ) -> bool:
         """Move LoRA into a GPU buffer to be used in the forward pass."""
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"base activate_adapter ENTER lora_id={lora_id} "
+                f"already_active={lora_id in self._active_adapters}"
+            )
+        _t_total = time.monotonic()
         if lora_id in self._active_adapters:
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"base activate_adapter EARLY-EXIT (already active) "
+                    f"lora_id={lora_id}"
+                )
             return False
         first_free_slot = next(
             (
@@ -285,22 +298,63 @@ class LoRAModelManager:
         logger.debug(
             "Activating LoRA. int id: %d, slot index: %d", lora_model.id, index
         )
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"base activate_adapter slot_index={index} "
+                f"n_modules={len(self.modules)} "
+                f"n_lora_in_model={len(lora_model.loras)}"
+            )
         self.lora_index_to_id[index] = lora_model.id
-        for module_name, module in self.modules.items():
+        _t_loop = time.monotonic()
+        _n_set = 0
+        _n_reset = 0
+        _n_total = len(self.modules)
+        _slowest_name = None
+        _slowest_dt_ms = 0.0
+        for _i, (module_name, module) in enumerate(self.modules.items()):
+            _t_mod = time.monotonic()
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
             if not module_lora:
                 module.reset_lora(index)
+                _n_reset += 1
                 logger.debug(
                     "No LoRA weights found for module %s, skipping.", module_name
                 )
-                continue
-
-            module.set_lora(
-                index,
-                module_lora.lora_a,
-                module_lora.lora_b,
+            else:
+                module.set_lora(
+                    index,
+                    module_lora.lora_a,
+                    module_lora.lora_b,
+                )
+                _n_set += 1
+                logger.debug(
+                    "Successfully loaded LoRA weights for module %s.", module_name
+                )
+            if lora_dbg_enabled():
+                _dt_mod_ms = (time.monotonic() - _t_mod) * 1000
+                if _dt_mod_ms > _slowest_dt_ms:
+                    _slowest_dt_ms = _dt_mod_ms
+                    _slowest_name = module_name
+                # Heartbeat every 64 modules so a hang inside the loop is
+                # localized to a window of <= 64 modules.
+                if _i % 64 == 0:
+                    lora_dbg(
+                        f"base activate_adapter loop i={_i}/{_n_total} "
+                        f"set={_n_set} reset={_n_reset} "
+                        f"last_dt={_dt_mod_ms:.2f}ms "
+                        f"last_name={module_name}"
+                    )
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"base activate_adapter post loop dt="
+                f"{(time.monotonic() - _t_loop) * 1000:.2f}ms "
+                f"set={_n_set} reset={_n_reset} "
+                f"slowest=({_slowest_name}, {_slowest_dt_ms:.2f}ms)"
             )
-            logger.debug("Successfully loaded LoRA weights for module %s.", module_name)
+            lora_dbg(
+                f"base activate_adapter EXIT lora_id={lora_id} total_dt="
+                f"{(time.monotonic() - _t_total) * 1000:.2f}ms"
+            )
         return True
 
     def _deactivate_adapter(self, lora_id: int):
@@ -322,6 +376,14 @@ class LoRAModelManager:
         )  # type: ignore
 
     def _set_adapter_mapping(self, mapping: LoRAMapping) -> None:
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"_set_adapter_mapping ENTER type={mapping.type} "
+                f"is_prefill={mapping.is_prefill} "
+                f"n_index={len(getattr(mapping, 'index_mapping', ()) or ())} "
+                f"n_prompt={len(getattr(mapping, 'prompt_mapping', ()) or ())} "
+                f"lora_index_to_id={self.lora_index_to_id}"
+            )
         # Default to the main language model wrapper
         if not (self.supports_mm and self.supports_tower_connector_lora):
             target_prefix = (
@@ -339,12 +401,25 @@ class LoRAModelManager:
         punica_wrapper = self._get_punica_wrapper(target_prefix)
         assert punica_wrapper is not None
 
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"_set_adapter_mapping pre punica.update_metadata "
+                f"target_prefix={target_prefix!r} "
+                f"punica_cls={type(punica_wrapper).__name__}"
+            )
+        _t = time.monotonic()
         punica_wrapper.update_metadata(
             mapping,
             self.lora_index_to_id,
             self.lora_slots + 1,
             self.vocab_size,
         )
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"_set_adapter_mapping post punica.update_metadata "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
+            lora_dbg("_set_adapter_mapping EXIT")
 
     def remove_all_adapters(self):
         """Remove all LoRAModels from the manager."""
@@ -920,6 +995,12 @@ class LRUCacheLoRAModelManager(LoRAModelManager):
     def add_adapter(self, lora: LoRAModel) -> bool:
         """Add a LoRAModel to the manager."""
         logger.debug("Adding lora. Model id: %d, int id: %d", lora.id, lora.id)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"LRU manager.add_adapter ENTER lora_id={lora.id} "
+                f"already_registered={lora.id in self._registered_adapters}"
+            )
+        _t = time.monotonic()
         if lora.id not in self._registered_adapters:
             self._add_adapter(lora)
             was_added = True
@@ -927,12 +1008,24 @@ class LRUCacheLoRAModelManager(LoRAModelManager):
             # We always touch to update the LRU cache order
             self._registered_adapters.touch(lora.id)
             was_added = False
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"LRU manager.add_adapter EXIT was_added={was_added} "
+                f"dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
         return was_added
 
     def activate_adapter(
         self,
         lora_id: int,
     ) -> bool:
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"LRU manager.activate_adapter ENTER lora_id={lora_id} "
+                f"n_active={len(self._active_adapters)} "
+                f"slots={self.lora_slots}"
+            )
+        _t = time.monotonic()
         if (
             lora_id not in self._active_adapters
             and len(self._active_adapters) >= self.lora_slots
@@ -941,6 +1034,11 @@ class LRUCacheLoRAModelManager(LoRAModelManager):
         result = super().activate_adapter(lora_id)
         # We always touch to update the LRU cache order
         self._active_adapters.touch(lora_id)
+        if lora_dbg_enabled():
+            lora_dbg(
+                f"LRU manager.activate_adapter EXIT lora_id={lora_id} "
+                f"result={result} dt={(time.monotonic() - _t) * 1000:.2f}ms"
+            )
         return result
 
     def remove_oldest_adapter(self) -> bool:
