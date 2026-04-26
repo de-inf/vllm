@@ -178,8 +178,22 @@ class WorkerLoRAManager:
             # Warn about adapter modules that will be ignored.
             target_modules = self.lora_config.target_modules
             expected_lora_modules_lst = list(expected_lora_modules)
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"_load_adapter pre warning_loop "
+                    f"n_modules={len(lora.loras)} "
+                    f"n_expected={len(expected_lora_modules_lst)} "
+                    f"n_target={len(target_modules) if target_modules else 0}"
+                )
+            _t_warn = time.monotonic()
+            _n_unsupported = 0
+            _n_off_target = 0
+            _n_iter = 0
+            _t_hb = _t_warn
             for module_name in lora.loras:
+                _n_iter += 1
                 if not is_supported_lora_module(module_name, expected_lora_modules_lst):
+                    _n_unsupported += 1
                     logger.warning_once(
                         "LoRA module '%s' in adapter '%s' is not in the "
                         "model's supported LoRA target modules [%s]. "
@@ -194,6 +208,7 @@ class WorkerLoRAManager:
                     target_modules,
                     packed_modules_mapping,
                 ):
+                    _n_off_target += 1
                     logger.warning_once(
                         "LoRA module '%s' in adapter '%s' is not in the "
                         "deployment-time target_modules restriction [%s]."
@@ -202,6 +217,24 @@ class WorkerLoRAManager:
                         lora_request.lora_path,
                         ", ".join(sorted(target_modules)),
                     )
+                if lora_dbg_enabled() and _n_iter % 4096 == 0:
+                    _now = time.monotonic()
+                    lora_dbg(
+                        f"_load_adapter warning_loop heartbeat "
+                        f"i={_n_iter}/{len(lora.loras)} "
+                        f"unsupported={_n_unsupported} off_target={_n_off_target} "
+                        f"chunk_dt={(_now - _t_hb) * 1000:.2f}ms "
+                        f"elapsed={(_now - _t_warn) * 1000:.2f}ms "
+                        f"last_module={module_name}"
+                    )
+                    _t_hb = _now
+            if lora_dbg_enabled():
+                lora_dbg(
+                    f"_load_adapter post warning_loop "
+                    f"dt={(time.monotonic() - _t_warn) * 1000:.2f}ms "
+                    f"n_iter={_n_iter} unsupported={_n_unsupported} "
+                    f"off_target={_n_off_target}"
+                )
 
         except FileNotFoundError as e:
             # FileNotFoundError should be raised if both
