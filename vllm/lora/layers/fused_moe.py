@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
+import sys
+import time
 
 import torch
 import torch.nn as nn
@@ -39,6 +42,25 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
 )
 
 from .utils import _get_lora_device, try_get_optimal_moe_lora_config
+
+# === LORA-DBG: lightweight tracing for the LoRA-MoE wrap path ===
+# Toggle with VLLM_LORA_DBG=1. Writes to stderr with flush=True so messages
+# survive even when the worker freezes. Counters are per-process and per-layer.
+_LORA_DBG = os.environ.get("VLLM_LORA_DBG", "0") == "1"
+_LORA_DBG_T0 = time.monotonic()
+
+
+def _lora_dbg(msg: str) -> None:
+    if not _LORA_DBG:
+        return
+    pid = os.getpid()
+    t = time.monotonic() - _LORA_DBG_T0
+    print(f"[LORA-DBG t={t:8.3f}s pid={pid}] {msg}", file=sys.stderr, flush=True)
+
+
+# Per-process layer counter so we can label decorator prints by layer index.
+_LORA_DBG_LAYER_IDX = [0]
+# === end LORA-DBG ===
 
 
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
@@ -140,6 +162,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if getattr(self.base_layer.quant_method, "supports_internal_mk", False):
             # Use the existing modular kernel from the quant method
             m_fused_moe_fn = self.base_layer.quant_method.moe_kernel
+            _lora_wrap_path = "internal_mk"
+            if _LORA_DBG:
+                _se_pre = getattr(m_fused_moe_fn, "shared_experts", "missing")
+                _owns_pre = getattr(m_fused_moe_fn, "owns_shared_experts", "missing")
+                _se_name = type(_se_pre).__name__ if _se_pre is not None else None
+                _lora_dbg(
+                    f"_inject_lora_into_fused_moe pre-reset "
+                    f"shared_experts={_se_name} "
+                    f"owns_shared_experts={_owns_pre}"
+                )
             # Don't let the kernel own shared experts so the runner can
             # overlap them with routed experts via a separate CUDA stream.
             m_fused_moe_fn.shared_experts = None
@@ -154,6 +186,29 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     prepare_finalize, self.base_layer
                 ),
             )
+            _lora_wrap_path = "fresh"
+
+        if _LORA_DBG:
+            try:
+                pf_name = type(m_fused_moe_fn.prepare_finalize).__name__
+            except Exception:
+                pf_name = "?"
+            try:
+                experts_name = type(m_fused_moe_fn.impl.fused_experts).__name__
+            except Exception:
+                experts_name = "?"
+            inplace = getattr(m_fused_moe_fn, "inplace", "?")
+            mpc = getattr(m_fused_moe_fn, "moe_parallel_config", None)
+            qm = type(self.base_layer.quant_method).__name__
+            base_id = id(self.base_layer)
+            _lora_dbg(
+                f"_inject_lora_into_fused_moe base_layer_id={base_id} "
+                f"qm={qm} path={_lora_wrap_path} pf={pf_name} "
+                f"experts={experts_name} inplace={inplace} "
+                f"mpc=(tp={getattr(mpc, 'tp_size', '?')},"
+                f"dp={getattr(mpc, 'dp_size', '?')},"
+                f"ep={getattr(mpc, 'ep_size', '?')})"
+            )
 
         if quant_config.use_mxfp4_w4a16:
             assert isinstance(
@@ -163,8 +218,26 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             assert isinstance(m_fused_moe_fn.impl.fused_experts, TritonExperts)
 
+        # Layer index for debug labeling, plus per-phase call counters.
+        _dbg_layer_idx = _LORA_DBG_LAYER_IDX[0]
+        _LORA_DBG_LAYER_IDX[0] += 1
+        _dbg_counters = {"fwd": 0, "act": 0, "moe_sum": 0}
+
         def fwd_decorator(layer, func):
             def wrapper(*args, **kwargs):
+                _dbg_counters["fwd"] += 1
+                _n = _dbg_counters["fwd"]
+                if _LORA_DBG:
+                    hs = kwargs.get("hidden_states")
+                    tk = kwargs.get("topk_ids")
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} fwd#{_n} ENTER "
+                        f"hs={tuple(hs.shape) if hs is not None else None}"
+                        f"/{getattr(hs, 'dtype', None)} "
+                        f"topk_ids={tuple(tk.shape) if tk is not None else None} "
+                        f"adapter_enabled={getattr(self, 'adapter_enabled', None)}"
+                    )
+                _t0 = time.monotonic()
                 moe_state_dict["hidden_states"] = kwargs["hidden_states"]
                 moe_state_dict["topk_ids"] = kwargs["topk_ids"]
                 moe_state_dict["topk_weights"] = kwargs["topk_weights"]
@@ -173,13 +246,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     "apply_router_weight_on_input"
                 ]
                 result = func(*args, **kwargs)
+                if _LORA_DBG:
+                    dt = (time.monotonic() - _t0) * 1000
+                    _lora_dbg(f"L{_dbg_layer_idx} fwd#{_n} EXIT  dt={dt:8.2f}ms")
                 return result
 
             return wrapper
 
         def act_decorator(layer, func):
             def wrapper(*args, **kwargs):
+                _dbg_counters["act"] += 1
+                _n = _dbg_counters["act"]
+                _t0 = time.monotonic()
                 _, output, input = args
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} act#{_n} ENTER "
+                        f"input={tuple(input.shape)}/{input.dtype} "
+                        f"output={tuple(output.shape)}/{output.dtype}"
+                    )
 
                 hidden_states = moe_state_dict["hidden_states"]
                 topk_weights = moe_state_dict["topk_weights"]
@@ -217,6 +302,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 )
 
                 # get the block size of m from customized config or default config
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} act#{_n} pre moe_lora_align_block_size "
+                        f"M={M} max_loras={self.max_loras} "
+                        f"local_num_experts={self.base_layer.local_num_experts} "
+                        f"BLOCK_SIZE_M={shrink_config.get('BLOCK_SIZE_M')} "
+                        f"naive={naive_block_assignment}"
+                    )
+                _t_align = time.monotonic()
                 (
                     token_lora_mapping,
                     sorted_token_ids_lora,
@@ -232,6 +326,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     expert_map,
                     naive_block_assignment=naive_block_assignment,
                 )
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} act#{_n} post moe_lora_align_block_size "
+                        f"dt={(time.monotonic() - _t_align) * 1000:.2f}ms"
+                    )
 
                 moe_state_dict["sorted_token_ids_lora"] = sorted_token_ids_lora
                 moe_state_dict["expert_ids_lora"] = expert_ids_lora
@@ -247,6 +346,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     )
                 #
 
+                if _LORA_DBG:
+                    _lora_dbg(f"L{_dbg_layer_idx} act#{_n} pre add_lora_fused_moe(W13)")
+                _t_add = time.monotonic()
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
                     hidden_states,
@@ -264,16 +366,39 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     fully_sharded=self.fully_sharded,
                     token_lora_mapping=token_lora_mapping,
                 )
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} act#{_n} post add_lora_fused_moe(W13) "
+                        f"dt={(time.monotonic() - _t_add) * 1000:.2f}ms"
+                    )
 
+                if _LORA_DBG:
+                    _lora_dbg(f"L{_dbg_layer_idx} act#{_n} pre activation_func")
+                _t_func = time.monotonic()
                 result = func(*args, **kwargs)
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} act#{_n} post activation_func "
+                        f"dt={(time.monotonic() - _t_func) * 1000:.2f}ms"
+                    )
 
                 moe_state_dict["intermediate_cache2"] = output
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} act#{_n} EXIT  total_dt="
+                        f"{(time.monotonic() - _t0) * 1000:.2f}ms"
+                    )
                 return result
 
             return wrapper
 
         def moe_sum_decorator(layer, func):
             def wrapper(*args, **kwargs):
+                _dbg_counters["moe_sum"] += 1
+                _n = _dbg_counters["moe_sum"]
+                _t0 = time.monotonic()
+                if _LORA_DBG:
+                    _lora_dbg(f"L{_dbg_layer_idx} moe_sum#{_n} ENTER")
                 hidden_states = moe_state_dict["hidden_states"]
                 topk_weights = moe_state_dict["topk_weights"]
 
@@ -314,6 +439,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
                 shard_size_w2 = divide(self.base_layer.hidden_size, self.tp_size)
 
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} moe_sum#{_n} pre add_lora_fused_moe(W2)"
+                    )
+                _t_add = time.monotonic()
                 self.punica_wrapper.add_lora_fused_moe(
                     intermediate_cache3,
                     intermediate_cache2,
@@ -333,8 +463,27 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     offset=shard_size_w2 * self.tp_rank if self.fully_sharded else 0,
                     token_lora_mapping=token_lora_mapping,
                 )
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} moe_sum#{_n} post add_lora_fused_moe(W2) "
+                        f"dt={(time.monotonic() - _t_add) * 1000:.2f}ms"
+                    )
 
+                if _LORA_DBG:
+                    _lora_dbg(f"L{_dbg_layer_idx} moe_sum#{_n} pre moe_sum_func")
+                _t_func = time.monotonic()
                 result = func(*args, **kwargs)
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} moe_sum#{_n} post moe_sum_func "
+                        f"dt={(time.monotonic() - _t_func) * 1000:.2f}ms"
+                    )
+
+                if _LORA_DBG:
+                    _lora_dbg(
+                        f"L{_dbg_layer_idx} moe_sum#{_n} EXIT  total_dt="
+                        f"{(time.monotonic() - _t0) * 1000:.2f}ms"
+                    )
                 return result
 
             return wrapper

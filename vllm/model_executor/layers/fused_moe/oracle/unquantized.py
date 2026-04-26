@@ -378,4 +378,26 @@ def make_unquantized_moe_kernel(
         inplace=(not moe_config.disable_inplace and not is_monolithic),
     )
 
+    # === LORA-DBG ===
+    import os as _os
+    import sys as _sys
+
+    if _os.environ.get("VLLM_LORA_DBG", "0") == "1":
+        _se_name = "None" if shared_experts is None else type(shared_experts).__name__
+        _inplace = not moe_config.disable_inplace and not is_monolithic
+        _owns = getattr(kernel, "owns_shared_experts", "?")
+        print(
+            f"[LORA-DBG pid={_os.getpid()}] make_unquantized_moe_kernel "
+            f"backend={backend.value} experts_cls={experts_cls.__name__} "
+            f"pf={prepare_finalize.__class__.__name__} "
+            f"act_fmt={prepare_finalize.activation_format.value} "
+            f"is_monolithic={is_monolithic} "
+            f"shared_experts={_se_name} "
+            f"inplace={_inplace} "
+            f"owns_shared_experts={_owns}",
+            file=_sys.stderr,
+            flush=True,
+        )
+    # === end LORA-DBG ===
+
     return kernel
