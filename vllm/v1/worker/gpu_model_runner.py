@@ -6876,7 +6876,7 @@ class GPUModelRunner(
             enable=self.model_config.enable_return_routed_experts,
             model_config=self.model_config,
             num_fused_shared_experts=num_fused_shared_experts,
-            num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_model_len=self.max_model_len,
             device=self.device,
             rank=tp_group.rank_in_group,

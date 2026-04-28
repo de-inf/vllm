@@ -173,7 +173,7 @@ class TestRoutedExpertsDeviceCache:
 
         cache = _RoutedExpertsDeviceCache(
             num_hidden_layers=40,
-            num_batched_tokens=8192,
+            max_num_batched_tokens=8192,
             num_experts_per_tok=8,
             device="cpu",
         )
@@ -188,7 +188,7 @@ class TestRoutedExpertsDeviceCache:
 
         cache = _RoutedExpertsDeviceCache(
             num_hidden_layers=40,
-            num_batched_tokens=8192,
+            max_num_batched_tokens=8192,
             num_experts_per_tok=8,
             device="cpu",
         )

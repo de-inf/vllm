@@ -60,7 +60,7 @@ class _RoutedExpertsDeviceCache:
 
     def __init__(
         self,
-        num_batched_tokens: int,
+        max_num_batched_tokens: int,
         num_hidden_layers: int,
         num_experts_per_tok: int,
         device: str,
@@ -70,7 +70,7 @@ class _RoutedExpertsDeviceCache:
         # writes expert IDs assuming contiguous row-major memory.
         self.num_hidden_layers = num_hidden_layers
         self.buffer = torch.zeros(
-            (num_hidden_layers, num_batched_tokens, num_experts_per_tok),
+            (num_hidden_layers, max_num_batched_tokens, num_experts_per_tok),
             dtype=self.DTYPE,
             device=device,
         )
@@ -178,7 +178,7 @@ class RoutedExpertsCapturer(ABC):
         enable: bool,
         model_config: ModelConfig,
         num_fused_shared_experts: int,
-        num_batched_tokens: int,
+        max_num_batched_tokens: int,
         max_model_len: int,
         device: str,
         shared_host_cache: _RoutedExpertsHostCache | None = None,
@@ -187,7 +187,7 @@ class RoutedExpertsCapturer(ABC):
         if enable:
             return _RoutedExpertsCapturerReal(
                 model_config,
-                num_batched_tokens=num_batched_tokens,
+                max_num_batched_tokens=max_num_batched_tokens,
                 num_fused_shared_experts=num_fused_shared_experts,
                 max_model_len=max_model_len,
                 device=device,
@@ -240,7 +240,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def __init__(
         self,
         model_config: ModelConfig,
-        num_batched_tokens: int,
+        max_num_batched_tokens: int,
         num_fused_shared_experts: int,
         max_model_len: int,
         device: str,
@@ -252,7 +252,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             "moe"
         )
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
-        self.num_batched_tokens = num_batched_tokens
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
         self._skip_host_cache = skip_host_cache
 
@@ -269,7 +269,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             )
 
         self.device_cache = _RoutedExpertsDeviceCache(
-            num_batched_tokens=self.num_batched_tokens,
+            max_num_batched_tokens=self.max_num_batched_tokens,
             num_hidden_layers=self.num_hidden_layers,
             num_experts_per_tok=self.num_experts_per_tok,
             device=device,
@@ -286,7 +286,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if not skip_host_cache:
             # Same (L, N, K) layout as device_cache.buffer.
             self._pinned_staging = torch.zeros(
-                (self.num_hidden_layers, num_batched_tokens, self.num_experts_per_tok),
+                (
+                    self.num_hidden_layers,
+                    max_num_batched_tokens,
+                    self.num_experts_per_tok,
+                ),
                 dtype=_RoutedExpertsDeviceCache.DTYPE,
                 pin_memory=True,
             )
@@ -682,7 +686,7 @@ def init_routed_experts_capturer_with_shared_cache(
     enable: bool,
     model_config: ModelConfig,
     num_fused_shared_experts: int,
-    num_batched_tokens: int,
+    max_num_batched_tokens: int,
     max_model_len: int,
     device: str,
     rank: int = 0,
@@ -704,7 +708,7 @@ def init_routed_experts_capturer_with_shared_cache(
             enable=True,
             model_config=model_config,
             num_fused_shared_experts=num_fused_shared_experts,
-            num_batched_tokens=num_batched_tokens,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
             device=device,
             skip_host_cache=True,
@@ -716,7 +720,7 @@ def init_routed_experts_capturer_with_shared_cache(
         enable=True,
         model_config=model_config,
         num_fused_shared_experts=num_fused_shared_experts,
-        num_batched_tokens=num_batched_tokens,
+        max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         device=device,
         skip_host_cache=False,
