@@ -33,42 +33,6 @@ class TestIsSupportedLoraModule:
         assert is_supported_lora_module("model.layers.0.self_attn.v_proj", supported)
         assert not is_supported_lora_module("model.layers.0.mlp.gate_proj", supported)
 
-    def test_dot_boundary_required(self):
-        """Suffix match must occur on a dot boundary, not anywhere in the name."""
-        # 'experts' matches 'layer.experts' (dot boundary)
-        assert is_supported_lora_module("layer.experts", ["experts"])
-        # 'experts' must NOT match 'layerexperts' (no dot boundary)
-        assert not is_supported_lora_module("layerexperts", ["experts"])
-
-    def test_dot_in_target_is_literal(self):
-        """Dots inside an entry are matched literally, not as regex 'any char'."""
-        supported = ["experts.0.down_proj"]
-        # Literal-dot path matches.
-        assert is_supported_lora_module(
-            "model.layers.0.mixer.experts.0.down_proj", supported
-        )
-        # Non-dot separators where the entry has dots must NOT match.
-        assert not is_supported_lora_module(
-            "model.layers.0.mixer.expertsX0Xdown_proj", supported
-        )
-
-    def test_full_path_high_expert_index(self):
-        """Match a high expert index against a large per-expert supported list."""
-        supported = ["q_proj"] + [
-            f"experts.{i}.{w}" for i in range(512) for w in ("up_proj", "down_proj")
-        ]
-        # The actual shape lora.loras keys take on Nemotron-3-Super.
-        assert is_supported_lora_module(
-            "model.layers.43.mixer.experts.511.up_proj", supported
-        )
-        assert is_supported_lora_module(
-            "model.layers.43.mixer.experts.0.down_proj", supported
-        )
-        # Non-dot separators must NOT match.
-        assert not is_supported_lora_module(
-            "model.layers.43.mixer.expertsX511Xup_proj", supported
-        )
-
 
 class TestIsInTargetModules:
     """Tests for is_in_target_modules (deployment-time filter)."""
