@@ -30,6 +30,9 @@ def _pad_tensor_dim(
     dim: int,
     padded_size: int,
 ) -> torch.Tensor:
+    """No using torch.nn.functional.pad.
+    Allocating same-dtype zero block and concatenating along the target dim is clearer.
+    """
     pad_size = padded_size - tensor.size(dim)
     if pad_size == 0:
         return tensor
@@ -178,13 +181,14 @@ def apply_fp4_marlin_linear(
     bias: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+    padded_size_n: int | None = None,
 ) -> torch.Tensor:
     # For GPUs that lack FP4 hardware support, we can leverage the
     # Marlin kernel for fast weight-only FP4 quantization
 
     reshaped_x = input.reshape(-1, input.shape[-1])
     original_size_n = size_n
-    padded_size_n = getattr(weight, "marlin_padded_size_n", size_n)
+    padded_size_n = padded_size_n if padded_size_n is not None else size_n
     out_shape = input.shape[:-1] + (original_size_n,)
 
     use_atomic_add = should_use_atomic_add_reduce(
@@ -252,7 +256,7 @@ def prepare_fp4_layer_for_marlin(
     param_dtype = layer.params_dtype
 
     if padding_n_required:
-        logger.warning_once("Padding is required for Marlin NvFp4 linear kernel.")
+        logger.warning_once("Padding is required for Marlin FP4 linear kernel.")
         layer.weight = torch.nn.Parameter(
             _pad_tensor_dim(layer.weight.data, dim=0, padded_size=part_size_n),
             requires_grad=False,
@@ -285,7 +289,7 @@ def prepare_fp4_layer_for_marlin(
         is_a_8bit=is_a_8bit,
     )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
-    layer.weight.marlin_padded_size_n = part_size_n
+    layer.marlin_padded_size_n = part_size_n
 
     # WEIGHT SCALES
     # Permute scales
