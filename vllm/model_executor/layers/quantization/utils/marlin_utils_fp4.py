@@ -256,6 +256,9 @@ def prepare_fp4_layer_for_marlin(
     param_dtype = layer.params_dtype
 
     if padding_n_required:
+        # Marlin FP4 kernels require the output/N dimension to be tile-aligned.
+        # Without this, repack fails with:
+        # RuntimeError: size_n = ... is not divisible by tile_n_size = 64.
         logger.warning_once("Padding is required for Marlin FP4 linear kernel.")
         layer.weight = torch.nn.Parameter(
             _pad_tensor_dim(layer.weight.data, dim=0, padded_size=part_size_n),
