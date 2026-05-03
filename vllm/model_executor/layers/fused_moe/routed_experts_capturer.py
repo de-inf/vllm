@@ -756,6 +756,26 @@ def bind_routing_capture_to_model(model) -> None:
     bound = 0
     for module in model.modules():
         if isinstance(module, FusedMoE) and hasattr(module, "moe_layer_id"):
+            # Per-FusedMoE configurations not yet validated for routing
+            # capture. These signals are only set after model init, so a
+            # config-level guard cannot see them.
+            if module.moe_config.is_sequence_parallel:
+                raise NotImplementedError(
+                    "routed-experts capture is not yet validated with "
+                    "sequence parallelism on the FusedMoE layer "
+                    "(moe_config.is_sequence_parallel=True)."
+                )
+            if (
+                module.moe_config.dp_size > 1
+                and not module.quant_method.supports_internal_mk
+            ):
+                raise NotImplementedError(
+                    "routed-experts capture is not yet validated with "
+                    "naive DP dispatch (non-modular quant method "
+                    f"{type(module.quant_method).__name__}, "
+                    f"dp_size={module.moe_config.dp_size})."
+                )
+
             layer_id = module.moe_layer_id
             layer_buf = buffer[layer_id]  # (N_max, K)
             module._routing_replay_out = layer_buf
