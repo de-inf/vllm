@@ -294,6 +294,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 dtype=_RoutedExpertsDeviceCache.DTYPE,
                 pin_memory=True,
             )
+            # Private device snapshot: source for the async D2H. Decouples
+            # the in-flight copy from device_cache.buffer, which the next
+            # step's MoE writes overwrite in place on main_stream.
+            self._device_staging = torch.empty_like(self.device_cache.buffer)
             self._copy_stream = torch.cuda.Stream(device=device)
             self._copy_event = torch.cuda.Event()
 
@@ -306,6 +310,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             )
         else:
             self._pinned_staging = None
+            self._device_staging = None
             self._copy_stream = None
             self._copy_event = None
             logger.info(
@@ -340,14 +345,20 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if total_tokens == 0:
             return
 
-        # 2. Issue new async D2H copy on a dedicated stream.
-        #    Device buffer layout is (L, N, K); copy the first total_tokens
-        #    along the N dimension for every layer.
+        # 2. Snapshot the device buffer on main_stream into a private
+        #    staging buffer, then issue the D2H from the staging buffer
+        #    on a dedicated copy stream. The snapshot serializes after
+        #    the current step's MoE writes (same stream) and is private
+        #    from the next step's MoE writes, so the in-flight D2H is
+        #    not aliased by step N+1's forward under async scheduling.
         main_stream = torch.cuda.current_stream(self._copy_stream.device)
+        self._device_staging[:, :total_tokens, :].copy_(
+            self.device_cache.buffer[:, :total_tokens, :], non_blocking=True
+        )
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_stream(main_stream)
             self._pinned_staging[:, :total_tokens, :].copy_(
-                self.device_cache.buffer[:, :total_tokens, :], non_blocking=True
+                self._device_staging[:, :total_tokens, :], non_blocking=True
             )
             self._copy_event.record()
 
