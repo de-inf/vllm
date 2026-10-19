@@ -148,9 +148,11 @@ class FlashInferCuteDSLMxfp8Experts(mk.FusedMoEExpertsModular):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        # Tokens are replicated across EP ranks (no dispatcher); EP is handled by
-        # local_expert_offset / num_local_experts in the kernel.
-        return moe_parallel_config.dp_size == 1
+        # Every rank sees all tokens with global expert ids (replicated under TP, or
+        # all-gathered by the Standard-format DP dispatchers); EP is handled by
+        # local_expert_offset / num_local_experts in the kernel. Batched-format
+        # dispatchers are excluded by activation_format().
+        return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()

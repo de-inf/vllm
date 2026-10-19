@@ -69,6 +69,18 @@ def test_cutedsl_mxfp8_selected_by_name():
     assert experts_cls is FlashInferCuteDSLMxfp8Experts
 
 
+def test_cutedsl_mxfp8_selected_with_dp_ep():
+    cfg = _config()
+    cfg = dataclasses.replace(
+        cfg,
+        moe_parallel_config=dataclasses.replace(
+            cfg.moe_parallel_config, dp_size=4, ep_size=4, use_ep=True
+        ),
+    )
+    with _blackwell():
+        assert _select_kernel_cls(_BACKEND, cfg) is FlashInferCuteDSLMxfp8Experts
+
+
 @pytest.mark.parametrize(
     "config",
     [
