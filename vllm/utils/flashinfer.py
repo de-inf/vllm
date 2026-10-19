@@ -314,6 +314,10 @@ flashinfer_cute_dsl_fused_moe_nvfp4 = _lazy_import_wrapper(
 flashinfer_convert_sf_to_mma_layout = _lazy_import_wrapper(
     "flashinfer.cute_dsl.utils", "convert_sf_to_mma_layout"
 )
+flashinfer_cute_dsl_fused_moe = _lazy_import_wrapper("flashinfer", "cute_dsl_fused_moe")
+flashinfer_convert_row_major_sf_to_mma_layout = _lazy_import_wrapper(
+    "flashinfer.cute_dsl.utils", "convert_row_major_sf_to_mma_layout"
+)
 flashinfer_b12x_fused_moe = _lazy_import_wrapper(
     "flashinfer.fused_moe", "b12x_fused_moe"
 )
@@ -594,6 +598,25 @@ def has_flashinfer_cutedsl_moe_nvfp4() -> bool:
         return False
     mod = _get_submodule("flashinfer")
     return mod is not None and hasattr(mod, "cute_dsl_fused_moe_nvfp4")
+
+
+@functools.cache
+def has_flashinfer_cutedsl_moe_mxfp8() -> bool:
+    """Return ``True`` if FlashInfer's cute_dsl_fused_moe supports MXFP8 weights.
+
+    ``quant_mode="mxfp8"`` ships together with the row-major scale conversion
+    helper, so the helper is used as the probe.
+    """
+    if not has_flashinfer_cutedsl():
+        return False
+    mod = _get_submodule("flashinfer")
+    utils_mod = _get_submodule("flashinfer.cute_dsl.utils")
+    return (
+        mod is not None
+        and hasattr(mod, "cute_dsl_fused_moe")
+        and utils_mod is not None
+        and hasattr(utils_mod, "convert_row_major_sf_to_mma_layout")
+    )
 
 
 @functools.cache
@@ -1271,9 +1294,11 @@ __all__ = [
     "scaled_fp4_grouped_quantize",
     "nvfp4_block_scale_interleave",
     "flashinfer_cute_dsl_fused_moe_nvfp4",
+    "flashinfer_cute_dsl_fused_moe",
     "flashinfer_b12x_fused_moe",
     "flashinfer_get_hybrid_num_tokens_buckets",
     "flashinfer_convert_sf_to_mma_layout",
+    "flashinfer_convert_row_major_sf_to_mma_layout",
     "trtllm_fp4_block_scale_moe",
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
@@ -1291,6 +1316,7 @@ __all__ = [
     "has_flashinfer_recurrent_kda",
     "has_flashinfer_fused_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
+    "has_flashinfer_cutedsl_moe_mxfp8",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",

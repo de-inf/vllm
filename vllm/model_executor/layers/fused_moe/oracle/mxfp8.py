@@ -30,6 +30,8 @@ _SUPPORTED_BACKENDS = (
     Fp8MoeBackend.TRITON_MXFP8,
     Fp8MoeBackend.EMULATION,
 )
+# Not in the list above: FLASHINFER_CUTEDSL_MXFP8 (Blackwell SM100 family,
+# non-gated ReLU² experts only) is selected with --moe-backend flashinfer_cutedsl.
 
 _BACKEND_NAME_MAP: dict[str, Fp8MoeBackend] = {
     "flashinfer_trtllm": Fp8MoeBackend.FLASHINFER_TRTLLM,
@@ -39,6 +41,7 @@ _BACKEND_NAME_MAP: dict[str, Fp8MoeBackend] = {
     "aiter": Fp8MoeBackend.AITER_MXFP8,
     "triton": Fp8MoeBackend.TRITON_MXFP8,
     "humming": Fp8MoeBackend.HUMMING,
+    "flashinfer_cutedsl": Fp8MoeBackend.FLASHINFER_CUTEDSL_MXFP8,
 }
 
 
@@ -69,6 +72,12 @@ def _mxfp8_backend_to_kernel_cls(
         )
 
         return [Mxfp8NativeTritonExperts]
+    if backend == Fp8MoeBackend.FLASHINFER_CUTEDSL_MXFP8:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_mxfp8_moe import (  # noqa: E501
+            FlashInferCuteDSLMxfp8Experts,
+        )
+
+        return [FlashInferCuteDSLMxfp8Experts]
     if backend == Fp8MoeBackend.EMULATION:
         from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
             Mxfp8EmulationTritonExperts,

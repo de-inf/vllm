@@ -74,6 +74,8 @@ class Fp8MoeBackend(Enum):
     TRITON_MXFP8 = "TRITON_MXFP8"
     # MXFP8 MoE via AITER (FlyDSL two-stage grouped GEMM) on gfx950.
     AITER_MXFP8 = "AITER_MXFP8"
+    # MXFP8 x MXFP8 MoE via FlashInfer's CuTe-DSL fused MoE (Blackwell SM100/103).
+    FLASHINFER_CUTEDSL_MXFP8 = "FLASHINFER_CUTEDSL_MXFP8"
 
 
 def _get_priority_backends(
@@ -713,6 +715,8 @@ def convert_to_fp8_moe_kernel_format(
             # the MXFP8 weights as-is — neither needs a load-time layout change.
             Fp8MoeBackend.EMULATION,
             Fp8MoeBackend.TRITON_MXFP8,
+            # The CuTe-DSL experts re-lay out the scales themselves.
+            Fp8MoeBackend.FLASHINFER_CUTEDSL_MXFP8,
         ]:
             raise ValueError(f"Unsupported FP8 MoE backend: {fp8_backend.value}")
 
