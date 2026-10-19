@@ -43,9 +43,9 @@ _SELECTION_CASES = [
     (103, (128, 128), FlashInferCutedslMxfp8LinearKernel),
     (103, (130, 256), FlashInferCutedslMxfp8LinearKernel),
     (120, (128, 128), FlashInferCutlassMxfp8LinearKernel),
-    (120, (130, 256), MarlinMxfp8LinearKernel),
+    (120, (130, 256), FlashInferCutlassMxfp8LinearKernel),
     (121, (128, 128), FlashInferCutlassMxfp8LinearKernel),
-    (121, (130, 256), MarlinMxfp8LinearKernel),
+    (121, (130, 256), FlashInferCutlassMxfp8LinearKernel),
     *[
         (capability, shape, MarlinMxfp8LinearKernel)
         for capability in (100, 103, 120, 121)
@@ -108,17 +108,14 @@ def _patch_cuda_platform(capability: int):
         yield
 
 
-@pytest.mark.parametrize(
-    ("capability", "expected"),
-    [(100, True), (103, True), (120, False), (121, False)],
-)
-def test_cutlass_mxfp8_requires_aligned_n_only_on_sm12x(capability, expected):
-    """(130, 256) passes the generic mm_mxfp8 limits. Only the SM12x CUTLASS
-    backend needs N % 32 == 0, so SM100/103 must keep accepting it."""
+@pytest.mark.parametrize("capability", [100, 103, 120, 121])
+def test_cutlass_mxfp8_accepts_unaligned_n(capability):
+    """CUTLASS mm_mxfp8 needs N % 32 == 0 on SM100 and SM12x; the kernel pads
+    N, so (130, 256) must be accepted everywhere."""
     config = Mxfp8LinearLayerConfig(weight_shape=(130, 256))
     with _patch_cuda_platform(capability):
-        can_implement, _ = FlashInferCutlassMxfp8LinearKernel.can_implement(config)
-    assert can_implement == expected
+        can_implement, reason = FlashInferCutlassMxfp8LinearKernel.can_implement(config)
+    assert can_implement, reason
 
 
 @pytest.mark.parametrize(
